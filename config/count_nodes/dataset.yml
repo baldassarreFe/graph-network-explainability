@@ -1,0 +1,21 @@
+datasets:
+  edge_features_shape: 2
+  node_features_shape: 4
+  global_features_shape: 2
+  informative_features: 2
+  _train_:
+    min_nodes: 0
+    max_nodes: 20
+    num_samples: 100_000
+  _val_:
+    min_nodes: 20
+    max_nodes: 60
+    num_samples: 50_000
+  _test_:
+    min_nodes: 0
+    max_nodes: 60
+    num_samples: 100_000
+
+opts:
+  seed: _auto_
+  folder: ~/experiments/count-nodes

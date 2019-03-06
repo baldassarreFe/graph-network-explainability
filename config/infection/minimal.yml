@@ -1,0 +1,6 @@
+model:
+  _class_: infection.networks.MinimalGN
+  in_edge_features_shape: 2
+  in_node_features_shape: 4
+  out_edge_features_shape: 2
+  out_node_features_shape: 1

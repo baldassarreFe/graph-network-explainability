@@ -1,0 +1,17 @@
+training:
+  batch_size: 1_000
+  epochs: 20
+  save_every: 0
+  restore: False
+  l1: 0
+
+opts:
+  log: True
+  folder: ~/experiments/count-nodes
+  session: _auto_
+  cpus: _auto_
+  seed: _auto_
+  device: _auto_
+
+optimizer:
+  _class_: torch.optim.Adam

@@ -1,0 +1,5 @@
+model:
+  _class_: count_nodes.networks.MinimalGN
+  in_node_features_shape: 4
+  out_node_features_shape: 1
+  out_global_features_shape: 1

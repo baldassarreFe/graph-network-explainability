@@ -1,0 +1,23 @@
+datasets:
+  _train_:
+    min_nodes: 10
+    max_nodes: 30
+    max_percent_sick: .1
+    max_percent_immune: .3
+    num_samples: 100_000
+  _val_:
+    min_nodes: 10
+    max_nodes: 30
+    max_percent_sick: .1
+    max_percent_immune: .3
+    num_samples: 100_000
+  _test_:
+    min_nodes: 10
+    max_nodes: 60
+    max_percent_sick: .4
+    max_percent_immune: .6
+    num_samples: 100_000
+
+opts:
+  seed: _auto_
+  folder: ~/experiments/infection
