@@ -68,7 +68,7 @@ class Config(Munch):
                 import git
                 with contextlib.suppress(git.InvalidGitRepositoryError):
                     repo = git.Repo(search_parent_directories=True)
-                    config.opts.commit = config.opts.get('commit', []).append(repo.head.object.hexsha)
+                    config.opts.commit = repo.head.object.hexsha
 
     @staticmethod
     def _config_session(config):
