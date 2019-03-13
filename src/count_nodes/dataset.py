@@ -52,7 +52,7 @@ def create_and_save():
     import argparse
     from tqdm import tqdm
     from pathlib import Path
-    from config_manager import Config
+    from config import Config
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--yaml', nargs='+', default=[])

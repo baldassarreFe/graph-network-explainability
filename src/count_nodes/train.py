@@ -20,7 +20,7 @@ from tensorboardX import SummaryWriter
 from count_nodes.dataset import NodeCountDataset
 from saver import Saver
 from utils import load_class
-from config_manager import Config
+from config import Config
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--yaml', nargs='+', default=[])
