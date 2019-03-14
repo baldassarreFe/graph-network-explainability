@@ -35,7 +35,7 @@ For this task, the minimal version of the network should only use:
 1. Create base folder
     ```bash
     INFECTION=~/experiments/infection/
-    mkdir -p "$INFECTION/{runs,data}"
+    mkdir -p "$INFECTION/"{runs,data}
     ```
 2. Create dataset
     ```bash
@@ -59,7 +59,7 @@ For this task, the minimal version of the network should only use:
     python -m infection.train -m <dbaddr:dbport>:sacred with <model.yaml> <train.yaml> [<other config>]
 
     conda activate tg-experiments
-    for i in 1 2 3 4 5; do
+    for i in $(seq  0 9); do
        for type in full minimal; do
            for lr in .01 .001; do
                for wd in 0 .01 .001; do

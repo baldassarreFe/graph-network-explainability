@@ -276,4 +276,5 @@ def train(model, optimizer, training, opts, paths, _run, _seed):
     if logger is not None:
         logger.add_text('Parameters', textwrap.indent('\n\n'.join(params), '    '), global_step=ex.info['samples'])
 
-    logger.close()
+    if logger is not None:
+        logger.close()
