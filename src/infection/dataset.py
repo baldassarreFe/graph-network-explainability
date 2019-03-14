@@ -57,10 +57,14 @@ def generate(cfg):
     from tqdm import trange
     from utils import set_seeds
 
-    set_seeds(cfg.get('seed', 0))
+    cfg.setdefault('seed', 0)
+    set_seeds(cfg.seed)
+    print(f'Random seed: {cfg.seed}')
+
     folder = Path(cfg.folder).expanduser().resolve()
     folder.mkdir(parents=True, exist_ok=True)
     print(f'Saving datasets in: {folder}')
+
     with open(folder / 'datasets.yaml', 'w') as f:
         f.write(cfg.toYAML())
     for p, params in cfg.datasets.items():
