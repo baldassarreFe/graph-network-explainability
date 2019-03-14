@@ -1,16 +1,14 @@
 training:
   batch_size: 1_000
-  epochs: 100
-  save_every: 0
+  epochs: 20
   restore: False
 
 opts:
-  log: True
-  folder: ~/experiments/infection
-  session: _auto_
-  cpus: _auto_
-  seed: _auto_
-  device: _auto_
+  log_every: _batch_
+  save_every: _never_
 
 optimizer:
-  _class_: torch.optim.Adam
+  klass: torch.optim.Adam
+  params:
+    lr: .001
+

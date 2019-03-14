@@ -1,242 +1,279 @@
+import tqdm
+import socket
 import random
-import argparse
 import textwrap
-import torch_scatter
-
-import pandas as pd
+import multiprocessing
 from pathlib import Path
 
-import tqdm
-import numpy as np
-import torchgraphs as tg
-from munch import Munch
-
 import torch
+import torch.utils.data
 import torch.nn.functional as F
-from torch import nn, optim
-from torch.utils import data
-from tensorboardX import SummaryWriter
-from torchgraphs.utils import segment_lengths_to_ids
+import arrow
+import numpy as np
+import pandas as pd
+import torch_scatter
+import torchgraphs as tg
 
-from infection.dataset import InfectionDataset
+from sacred import Experiment
+from sacred.observers import RunObserver
+from sacred.observers.file_storage import FileStorageObserver, DEFAULT_FILE_STORAGE_PRIORITY
+from sacred.utils import apply_backspaces_and_linefeeds
+
 from saver import Saver
 from utils import load_class
-from config_manager import Config
+from .dataset import InfectionDataset
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--yaml', nargs='+', default=[])
-parser.add_argument('--dry-run', action='store_true')
-args, rest = parser.parse_known_args()
-
-config = Config()
-for y in args.yaml:
-    config.update_from_yaml(y)
-if len(rest) > 0:
-    if rest[0] != '--':
-        rest = ' '.join(rest)
-        print(f"Error: additional config must be separated by '--', got:\n{rest}")
-        exit(1)
-    config.update_from_cli(' '.join(rest[1:]))
-
-print(config.toYAML())
-if args.dry_run:
-    print('Dry run, exiting.')
-    exit(0)
-del args, rest
-
-random.seed(config.opts.seed)
-np.random.seed(config.opts.seed)
-torch.random.manual_seed(config.opts.seed)
-
-folder_base = (Path(config.opts.folder)).expanduser().resolve()
-folder_data = folder_base / 'data'
-folder_run = folder_base / 'runs' / config.opts.session
-saver = Saver(folder_run)
-logger = SummaryWriter(folder_run.as_posix())
-
-ModelClass = load_class(config.model._class_)
-net: nn.Module = ModelClass(**{k: v for k, v in config.model.items() if k != '_class_'})
-net.to(config.opts.device)
-
-OptimizerClass = load_class(config.optimizer._class_)
-optimizer: optim.Optimizer = OptimizerClass(params=net.parameters(),
-                                            **{k: v for k, v in config.optimizer.items() if k != '_class_'})
-
-if config.training.restore:
-    train_state = saver.load(model=net, optimizer=optimizer, device=config.training.device)
-else:
-    train_state = Munch(epochs=0, samples=0)
-
-if config.opts.log:
-    with open(folder_run / 'config.yml', mode='w') as f:
-        f.write(config.toYAML())
-    logger.add_text(
-        'Config',
-        textwrap.indent(config.toYAML(), '    '),
-        global_step=train_state.samples)
+ex = Experiment('infection')
+ex.captured_out_filter = apply_backspaces_and_linefeeds
 
 
-def make_dataloader(dataset, shuffle) -> data.DataLoader:
-    return data.DataLoader(
+class RunIdHack(RunObserver):
+    # The run id is assigned by the first observer that handles the started event,
+    # this hack makes sure that the run id matches the session name from the config
+    def __init__(self, run_id):
+        self.run_id = run_id
+        self.priority = 1_000_000
+
+    def started_event(self, ex_info, command, host_info, start_time, config, meta_info, _id):
+        return self.run_id
+
+
+# noinspection PyUnusedLocal
+@ex.config
+def config_autos():
+    opts = dict(
+        cpus=multiprocessing.cpu_count() - 1,
+        device='cuda' if torch.cuda.is_available() else 'cpu',
+        save_every='_never_',
+        log_every='_never_'
+    )
+    opts = dict(
+        session=f'{socket.gethostname()}_{arrow.utcnow()}'
+    )
+
+
+@ex.config_hook
+def cfg_hook(config, command_name, logger):
+    updates = {}
+    paths = config['paths']
+    if 'root' in paths:
+        updates['root'] = Path(paths['root']).expanduser().resolve()
+    if 'data' in paths:
+        updates['data'] = Path(paths['data']).expanduser().resolve()
+    else:
+        updates['data'] = Path(paths['root']).joinpath('data').expanduser().resolve()
+    if 'runs' in paths:
+        updates['runs'] = Path(paths['runs']).expanduser().resolve()
+    else:
+        updates['runs'] = Path(paths['root']).joinpath('runs').expanduser().resolve()
+
+    ex.observers.append(RunIdHack(config['opts']['session']))
+    if command_name != 'print_config' and config['opts']['log_every'] != '_never_':
+        ex.observers.append(FileStorageObserver.create(updates['runs']))
+    return dict(paths={n: p.as_posix() for n, p in updates.items()})
+
+
+def set_seeds(_seed):
+    random.seed(_seed)
+    np.random.seed(_seed)
+    torch.random.manual_seed(_seed)
+
+
+def load_model_opt(model, optimizer, opts):
+    model_class = load_class(model['klass'])
+    model = model_class(**model['params']).to(opts['device'])
+    opt_class = load_class(optimizer['klass'])
+    optimizer = opt_class(params=model.parameters(), **optimizer['params'])
+    return model, optimizer
+
+
+def prepare_saver(opts, paths):
+    if opts['save_every'] != '_never_':
+        saver = Saver(paths['runs'])
+        should_save = lambda epoch_idx: epoch_idx % opts['save_every'] == 0
+    else:
+        saver = None
+        should_save = lambda _: False
+    return saver, should_save
+
+
+def prepare_logger(training, opts, paths, _run):
+    if opts['log_every'] != '_never_':
+        from tensorboardX import SummaryWriter
+        logger = SummaryWriter(Path(paths['runs']).joinpath(opts['session']).as_posix())
+        mod = training['batch_size'] if opts['log_every'] == '_batch_' else int(opts['log_every'])
+        should_log = lambda samples: samples % mod == 0
+    else:
+        logger = None
+        should_log = lambda _: False
+    return logger, should_log
+
+
+def get_dataloader(name, paths, training, opts, shuffle):
+    path = Path(paths['data']).joinpath(name).with_suffix('.pt')
+    dataset = torch.load(path)
+    if not isinstance(dataset, InfectionDataset):
+        raise ValueError(f'Not an InfectionDataset: {path}')
+    return torch.utils.data.DataLoader(
         dataset,
-        batch_size=config.training.batch_size,
+        batch_size=training['batch_size'],
         collate_fn=tg.GraphBatch.collate,
-        num_workers=config.opts.cpus,
+        num_workers=opts['cpus'],
         shuffle=shuffle,
-        pin_memory='cuda' in str(config.opts.device),
+        pin_memory='cuda' in str(opts['device']),
         worker_init_fn=lambda _: np.random.seed(int(torch.initial_seed()) % (2 ** 32 - 1))
     )
 
 
-dataset_train: InfectionDataset = torch.load(folder_data / 'train.pt')
-dataset_val: InfectionDataset = torch.load(folder_data / 'val.pt')
-dataset_test: InfectionDataset = torch.load(folder_data / 'test.pt')
-dataloader_train = make_dataloader(dataset_train, shuffle=True)
-dataloader_val = make_dataloader(dataset_val, shuffle=False)
-dataloader_test = make_dataloader(dataset_test, shuffle=False)
+@ex.automain
+def train(model, optimizer, training, opts, paths, _run, _seed):
+    set_seeds(_seed)
+    opts['device'] = torch.device(opts['device'])
+    paths = {n: Path(p) for n, p in paths.items()}
+    model, optimizer = load_model_opt(model, optimizer, opts)
+    saver, should_save = prepare_saver(opts, paths)
+    logger, should_log = prepare_logger(training, opts, paths, _run)
 
-epoch_bar_postfix = {}
-epoch_start = train_state.epochs + 1
-epoch_end = train_state.epochs + 1 + config.training.epochs
-epoch_bar = tqdm.trange(epoch_start, epoch_end, desc='Training', unit='e', leave=True)
-for epoch in epoch_bar:
-    # Training loop
-    net.train()
-    losses_batch = 0
-    with tqdm.tqdm(desc=f'Train {epoch}', total=dataloader_train.dataset.num_samples, unit='g') as bar:
-        for graphs, targets in dataloader_train:
-            graphs = graphs.to(config.opts.device)
-            targets = targets.node_features.squeeze().to(config.opts.device)
+    _run.info['epochs'] = 0
+    _run.info['samples'] = 0
 
-            results = net(graphs).node_features.squeeze()
-            loss = F.binary_cross_entropy_with_logits(results, targets, reduction='mean')
+    dataloader_train = get_dataloader('train', paths, training, opts, shuffle=True)
+    dataloader_val = get_dataloader('val', paths, training, opts, shuffle=False)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step(closure=None)
+    epoch_bar_postfix = {}
+    epoch_start = _run.info['epochs'] + 1
+    epoch_end = _run.info['epochs'] + 1 + training['epochs']
+    epoch_bar = tqdm.trange(epoch_start, epoch_end, desc='Training', unit='e', leave=True)
+    for epoch in epoch_bar:
+        # Training loop
+        model.train()
+        losses_batch = 0
+        with tqdm.tqdm(desc=f'Train {epoch}', total=len(dataloader_train.dataset), unit='g') as bar:
+            for graphs, targets in dataloader_train:
+                graphs = graphs.to(opts['device'])
+                targets = targets.node_features.squeeze().to(opts['device'])
 
-            train_state.samples += graphs.num_graphs
-            losses_batch += loss.item() * graphs.num_graphs
-
-            bar.update(graphs.num_graphs)
-            bar.set_postfix_str(f'Loss: {loss.item():.9f}')
-            if config.opts.log:
-                logger.add_scalar('loss/train', loss.item(), global_step=train_state.samples)
-    epoch_bar_postfix['Train'] = f'{losses_batch / dataloader_train.dataset.num_samples:.4f}'
-    epoch_bar.set_postfix(epoch_bar_postfix)
-
-    # Saving
-    train_state.epochs += 1
-    if config.training.save_every > 0 and epoch % config.training.save_every == 0:
-        saver.save(id_=epoch, model=net, optimizer=optimizer, **train_state)
-
-    # Validation loop
-    net.eval()
-    losses_batch = 0
-    with torch.no_grad():
-        with tqdm.tqdm(desc=f'Val {epoch}', total=dataloader_val.dataset.num_samples, unit='g') as bar:
-            for graphs, targets in dataloader_val:
-                graphs = graphs.to(config.opts.device)
-                targets = targets.node_features.squeeze().to(config.opts.device)
-
-                results = net(graphs).node_features.squeeze()
+                results = model(graphs).node_features.squeeze()
                 loss = F.binary_cross_entropy_with_logits(results, targets, reduction='mean')
 
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step(closure=None)
+
+                _run.info['samples'] += graphs.num_graphs
                 losses_batch += loss.item() * graphs.num_graphs
+
                 bar.update(graphs.num_graphs)
                 bar.set_postfix_str(f'Loss: {loss.item():.9f}')
-    if config.opts.log:
-        logger.add_scalar(
-            'loss/val', losses_batch / dataloader_val.dataset.num_samples, global_step=train_state.samples)
-    epoch_bar_postfix['Val'] = f'{losses_batch / dataloader_val.dataset.num_samples:.4f}'
-    epoch_bar.set_postfix(epoch_bar_postfix)
-epoch_bar.close()
+                if should_log(_run.info['samples']):
+                    logger.add_scalar('loss/train', loss.item(), global_step=_run.info['samples'])
+                    _run.log_scalar('loss/train', loss.item(), step=_run.info['samples'])
+        epoch_bar_postfix['Train'] = f'{losses_batch / len(dataloader_train.dataset):.4f}'
+        epoch_bar.set_postfix(epoch_bar_postfix)
 
-net.eval()
-df = {k: [] for k in ['Loss', 'Nodes', 'Edges', 'Predict', 'Target']}
-with torch.no_grad():
-    with tqdm.tqdm(desc='Test', total=dataloader_test.dataset.num_samples, leave=True, unit='g') as bar:
-        for graphs, targets in dataloader_test:
-            graphs = graphs.to(config.opts.device)
-            targets = targets.node_features.squeeze().to(config.opts.device)
+        # Saving
+        _run.info['epochs'] += 1
+        if should_save(_run.info['epochs']):
+            saver.save(id_=epoch, model=model, optimizer=optimizer, **_run.info)
 
-            results = net(graphs).node_features.squeeze()
-            losses = F.binary_cross_entropy_with_logits(results, targets, reduction='none')
+        # Validation loop
+        model.eval()
+        losses_batch = 0
+        with torch.no_grad():
+            with tqdm.tqdm(desc=f'Val {epoch}', total=len(dataloader_val.dataset), unit='g') as bar:
+                for graphs, targets in dataloader_val:
+                    graphs = graphs.to(opts['device'])
+                    targets = targets.node_features.squeeze().to(opts['device'])
 
-            idx = segment_lengths_to_ids(graphs.num_nodes_by_graph)
-            losses_by_graph = torch_scatter.scatter_mean(losses, index=idx, dim=0, dim_size=graphs.num_graphs)
+                    results = model(graphs).node_features.squeeze()
+                    loss = F.binary_cross_entropy_with_logits(results, targets, reduction='mean')
 
-            df['Loss'].append(losses_by_graph.cpu())
-            df['Nodes'].append(graphs.num_nodes_by_graph.cpu())
-            df['Edges'].append(graphs.num_edges_by_graph.cpu())
-            df['Target'].append(torch_scatter.scatter_add(
-                targets.int(), index=idx, dim=0, dim_size=graphs.num_graphs).cpu())
-            df['Predict'].append(torch_scatter.scatter_add(
-                results.sigmoid(), index=idx, dim=0, dim_size=graphs.num_graphs).cpu())
+                    losses_batch += loss.item() * graphs.num_graphs
+                    bar.update(graphs.num_graphs)
+                    bar.set_postfix_str(f'Loss: {loss.item():.9f}')
+        if should_log(_run.info['samples']):
+            logger.add_scalar('loss/val', losses_batch / len(dataloader_val.dataset), global_step=_run.info['samples'])
+            _run.log_scalar('loss/val', losses_batch / len(dataloader_val.dataset), step=_run.info['samples'])
+        epoch_bar_postfix['Val'] = f'{losses_batch / len(dataloader_val.dataset):.4f}'
+        epoch_bar.set_postfix(epoch_bar_postfix)
+    epoch_bar.close()
 
-            bar.update(graphs.num_graphs)
-            bar.set_postfix_str(f'Loss: {losses.mean().item():.9f}')
-df = pd.DataFrame({k: np.concatenate(v) for k, v in df.items()}).rename_axis('GraphId').reset_index()
+    dataloader_test = get_dataloader('test', paths, training, opts, shuffle=False)
 
-# Split the results based on whether the number of nodes was present in the training set or not
-df_train_test = df \
-    .groupby(np.where(df.Nodes < dataset_train.max_nodes,
-                      f'Train [{dataset_train.min_nodes}, {dataset_train.max_nodes - 1})',
-                      f'Test  [{dataset_train.max_nodes}, {dataset_test.max_nodes - 1})')) \
-    .agg({'Nodes': ['min', 'max'], 'GraphId': 'count', 'Loss': 'mean'}) \
-    .sort_index(ascending=False) \
-    .rename_axis(index='Dataset') \
-    .rename(str.capitalize, axis='columns', level=1)
+    model.eval()
+    df = {k: [] for k in ['Loss', 'Nodes', 'Edges', 'Predict', 'Target']}
+    with torch.no_grad():
+        with tqdm.tqdm(desc='Test', total=len(dataloader_test.dataset), leave=True, unit='g') as bar:
+            for graphs, targets in dataloader_test:
+                graphs = graphs.to(opts['device'])
+                targets = targets.node_features.squeeze().to(opts['device'])
 
-# Split the results in ranges based on the number of nodes and compute the average loss per range
-df_losses_by_node_range = df \
-    .groupby(df.Nodes // 10) \
-    .agg({'Nodes': ['min', 'max'], 'GraphId': 'count', 'Loss': 'mean'}) \
-    .rename_axis(index='NodeRange') \
-    .rename(lambda node_group_min: f'[{node_group_min * 10}, {node_group_min * 10 + 10})', axis='index') \
-    .rename(str.capitalize, axis='columns', level=1)
+                results = model(graphs).node_features.squeeze()
+                losses = F.binary_cross_entropy_with_logits(results, targets, reduction='none')
 
-# Split the results in ranges based on the number of nodes and compute the average loss per range
-df_worst_best_graphs_by_node_range = df \
-    .groupby(df.Nodes // 10) \
-    .apply(lambda df_gr: pd.concat((df_gr.nlargest(5, 'Loss'), df_gr.nsmallest(3, 'Loss'))).set_index('GraphId')) \
-    .rename_axis(index={'Nodes': 'NodeRange'}) \
-    .rename(lambda node_group_min: f'[{node_group_min * 10}, {node_group_min * 10 + 10})', axis='index', level=0)
+                idx = tg.utils.segment_lengths_to_ids(graphs.num_nodes_by_graph)
+                losses_by_graph = torch_scatter.scatter_mean(losses, index=idx, dim=0, dim_size=graphs.num_graphs)
 
-print(
-    df_train_test.to_string(float_format=lambda x: f'{x:.2f}'),
-    df_losses_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'),
-    df_worst_best_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'),
-    sep='\n\n')
-if config.opts.log:
-    logger.add_text(
-        'Generalization',
-        textwrap.indent(df_train_test.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
-        global_step=train_state.samples)
-    logger.add_text(
-        'Loss by range',
-        textwrap.indent(df_losses_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
-        global_step=train_state.samples)
-    logger.add_text(
-        'Samples',
-        textwrap.indent(df_worst_best_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
-        global_step=train_state.samples)
+                df['Loss'].append(losses_by_graph.cpu())
+                df['Nodes'].append(graphs.num_nodes_by_graph.cpu())
+                df['Edges'].append(graphs.num_edges_by_graph.cpu())
+                df['Target'].append(torch_scatter.scatter_add(
+                    targets.int(), index=idx, dim=0, dim_size=graphs.num_graphs).cpu())
+                df['Predict'].append(torch_scatter.scatter_add(
+                    results.sigmoid(), index=idx, dim=0, dim_size=graphs.num_graphs).cpu())
 
-params = [f'{name}:\n{param.data.cpu().numpy().round(3)}' for name, param in net.named_parameters()]
-print('Parameters:', *params, sep='\n\n')
-if config.opts.log:
-    logger.add_text('Parameters', textwrap.indent('\n\n'.join(params), '    '), global_step=train_state.samples)
+                bar.update(graphs.num_graphs)
+                bar.set_postfix_str(f'Loss: {losses.mean().item():.9f}')
+    df = pd.DataFrame({k: np.concatenate(v) for k, v in df.items()}).rename_axis('GraphId').reset_index()
 
-logger.close()
+    # Split the results based on whether the number of nodes was present in the training set or not
+    df_train_test = df \
+        .groupby(np.where(df.Nodes < dataloader_train.dataset.max_nodes,
+                          f'Train [{dataloader_train.dataset.min_nodes}, {dataloader_train.dataset.max_nodes - 1})',
+                          f'Test  [{dataloader_train.dataset.max_nodes}, {dataloader_test.dataset.max_nodes - 1})')) \
+        .agg({'Nodes': ['min', 'max'], 'GraphId': 'count', 'Loss': 'mean'}) \
+        .sort_index(ascending=False) \
+        .rename_axis(index='Dataset') \
+        .rename(str.capitalize, axis='columns', level=1)
 
-'''
-TODO weight based on the number of the infected nodes per graph
-In the graphs we generate the degrees follow a power-law, there are many with 0 connections, bit less with 1 etc
-This means that a graph with many infected nodes is very rare.
-Should check the hist of the number of infected nodes per graph and use it to weight the loss graph-by-graph
+    # Split the results in ranges based on the number of nodes and compute the average loss per range
+    df_losses_by_node_range = df \
+        .groupby(df.Nodes // 10) \
+        .agg({'Nodes': ['min', 'max'], 'GraphId': 'count', 'Loss': 'mean'}) \
+        .rename_axis(index='NodeRange') \
+        .rename(lambda node_group_min: f'[{node_group_min * 10}, {node_group_min * 10 + 10})', axis='index') \
+        .rename(str.capitalize, axis='columns', level=1)
 
-TODO generalization should not be checked on larger graphs but on different connectivity models
-Even with larger graphs the connectivity patterns would remain the same unless we use a different networkx function
+    # Split the results in ranges based on the number of nodes and compute the average loss per range
+    df_worst_best_graphs_by_node_range = df \
+        .groupby(df.Nodes // 10) \
+        .apply(lambda df_gr: pd.concat((df_gr.nlargest(5, 'Loss'), df_gr.nsmallest(3, 'Loss'))).set_index('GraphId')) \
+        .rename_axis(index={'Nodes': 'NodeRange'}) \
+        .rename(lambda node_group_min: f'[{node_group_min * 10}, {node_group_min * 10 + 10})', axis='index', level=0)
 
-TODO compute precision-recall curve + area under curve for the test dataset, probably need to do it 'streaming'
-'''
+    print('',
+          df_train_test.to_string(float_format=lambda x: f'{x:.2f}'),
+          df_losses_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'),
+          df_worst_best_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'),
+          sep='\n\n')
+
+    if logger is not None:
+        logger.add_text(
+            'Generalization',
+            textwrap.indent(df_train_test.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
+            global_step=ex.info['samples'])
+        logger.add_text(
+            'Loss by range',
+            textwrap.indent(df_losses_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
+            global_step=ex.info['samples'])
+        logger.add_text(
+            'Samples',
+            textwrap.indent(df_worst_best_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
+            global_step=ex.info['samples'])
+
+    params = [f'{name}:\n{param.data.cpu().numpy().round(3)}' for name, param in model.named_parameters()]
+    print('Parameters:', *params, sep='\n\n')
+    if logger is not None:
+        logger.add_text('Parameters', textwrap.indent('\n\n'.join(params), '    '), global_step=ex.info['samples'])
+
+    logger.close()

@@ -31,21 +31,3 @@ with tf.summary.FileWriter(folder) as writer:
     writer.add_summary(layout_summary)
 
 print('Layout saved to', folder)
-
-"""
-import argparse
-from pathlib import Path
-
-from tensorboardX import SummaryWriter
-
-parser = argparse.ArgumentParser()
-parser.add_argument('folder', help='The log folder to place the layout in')
-args = parser.parse_args()
-
-folder = (Path(args.folder) / 'layout').expanduser().resolve()
-logger = SummaryWriter(folder.as_posix())
-
-logger.add_custom_scalars({
-    'Loss': {'loss': ['train', 'val']}
-})
-"""

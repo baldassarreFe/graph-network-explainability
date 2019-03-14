@@ -39,33 +39,45 @@ For this task, the minimal version of the network should only use:
     ```
 2. Create dataset
     ```bash
-    python -m infection.dataset --yaml <dataset.yml>
+    python -m infection.dataset generate <dataset.yml> folder="$INFECTION/data"
     ```
 3. Create tensorboard layout
     ```bash
     python -m infection.layout --folder "$INFECTION/runs"
     ```
-4. Launch experiments
+    
+4. Start a mongo db in a docker container and note its ip address
     ```bash
-    python -m infection.train --yaml <model.yml> <train.yml> -- [<other config>]
+    docker pull mongo:latest
+    docker run -d --name=mongo mongo
+    docker inspect mongo | grep -w IPAddress
+    docker network inspect bridge
+    ```
+   
+5. Launch experiments
+    ```bash
+    python -m infection.train -m <dbaddr:dbport>:sacred with <model.yaml> <train.yaml> [<other config>]
 
     conda activate tg-experiments
     for i in 1 2 3 4 5; do
        for type in full minimal; do
            for lr in .01 .001; do
                for wd in 0 .01 .001; do
-                   python -m infection.train --yaml ../config/infection/{train,${type}}.yml -- \
-                     opts.session=${type}_lr${lr}_wd${wd}_${i} \
-                     optimizer.lr=${lr} \
-                     training.l1=${wd} \
-                     training.epochs=40 \
-                     training.batch_size=1000
+                   python -m infection.train \
+                       -m 172.17.0.2:27017:sacred \
+                       with ../config/infection/{train,${type}}.yaml \
+                       paths.root=~/experiments/infection \
+                       opts.session=${type}_lr${lr}_wd${wd}_${i} \
+                       optimizer.lr=${lr} \
+                       training.l1=${wd} \
+                       training.epochs=20 \
+                       training.batch_size=1000
                done
            done
        done
     done
     ```
-5. Visualize   
-    ```bash
-    tensorboard --logdir "$INFECTION/runs"
-    ```
+6. Query logs and visualize
+   - Tensorboard: `tensorboard --logdir "$INFECTION/runs"`
+   - Mongo shell `docker run -it --rm mongo mongo <dbaddr:dbport>/sacred`
+   - Omniboard `docker run -it --rm -p 9000:9000 --name omniboard vivekratnavel/omniboard -m 172.17.0.2:27017:sacred`

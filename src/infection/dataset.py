@@ -1,35 +1,33 @@
-import numpy as np
-import networkx as nx
 from pathlib import Path
+from typing import List, Tuple
 
 import torch
-from torch.utils import data
-
+import torch.utils.data
+import numpy as np
+import networkx as nx
 import torchgraphs as tg
 
 
-class InfectionDataset(data.Dataset):
-    def __init__(self, max_percent_immune, max_percent_sick, min_nodes, max_nodes, num_samples):
+class InfectionDataset(torch.utils.data.Dataset):
+    def __init__(self, max_percent_immune, max_percent_sick, min_nodes, max_nodes):
         if max_percent_sick + max_percent_immune > 1:
             raise ValueError(f"Cannot have a population with `max_percent_sick`={max_percent_sick}"
                              f"and `max_percent_immune`={max_percent_immune}")
-        self.num_samples = num_samples
         self.min_nodes = min_nodes
         self.max_nodes = max_nodes
         self.max_percent_immune = max_percent_immune
         self.max_percent_sick = max_percent_sick
         self.node_features_shape = 4
         self.edge_features_shape = 2
-        self.samples = [None] * self.num_samples
+        self.samples: List[Tuple[tg.Graph, tg.Graph]] = []
 
     def __len__(self):
-        return self.num_samples
+        return len(self.samples)
 
     def __getitem__(self, item):
-        self.samples[item] = self.samples[item] if self.samples[item] is not None else self._random_sample()
         return self.samples[item]
 
-    def _random_sample(self):
+    def random_sample(self):
         num_nodes = np.random.randint(self.min_nodes, self.max_nodes)
         g_nx = nx.barabasi_albert_graph(num_nodes, 2).to_directed()
 
@@ -55,50 +53,80 @@ class InfectionDataset(data.Dataset):
         return g, target
 
 
-def create_and_save():
-    import random
-    import argparse
-    from tqdm import tqdm
-    from config_manager import Config
+def generate(cfg):
+    from tqdm import trange
+    from utils import set_seeds
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--yaml', nargs='+', default=[])
-    parser.add_argument('--dry-run', action='store_true')
-    args, rest = parser.parse_known_args()
-
-    config = Config()
-    for y in args.yaml:
-        config.update_from_yaml(y)
-    if len(rest) > 0:
-        if rest[0] != '--':
-            rest = ' '.join(rest)
-            print(f"Error: additional config must be separated by '--', got:\n{rest}")
-            exit(1)
-        config.update_from_cli(' '.join(rest[1:]))
-
-    print(config.toYAML())
-    if args.dry_run:
-        print('Dry run, exiting.')
-        exit(0)
-    del args, rest
-
-    random.seed(config.opts.seed)
-    np.random.seed(config.opts.seed)
-    torch.random.manual_seed(config.opts.seed)
-
-    folder = Path(config.opts.folder).expanduser().resolve() / 'data'
+    set_seeds(cfg.get('seed', 0))
+    folder = Path(cfg.folder).expanduser().resolve()
     folder.mkdir(parents=True, exist_ok=True)
-
-    datasets_common = {k: v for k, v in config.datasets.items() if k not in {'_train_', '_val_', '_test_'}}
-    for name in ['train', 'val', 'test']:
-        path = folder / f'{name}.pt'
-        dataset = InfectionDataset(
-            **datasets_common,
-            **{k: v for k, v in config.datasets.get(f'_{name}_', {}).items()}
-        )
-        samples = len([s for s in tqdm(dataset, desc=name.capitalize(), unit='samples', leave=True)])
+    print(f'Saving datasets in: {folder}')
+    with open(folder / 'datasets.yaml', 'w') as f:
+        f.write(cfg.toYAML())
+    for p, params in cfg.datasets.items():
+        dataset = InfectionDataset(**{k: v for k, v in params.items() if k != 'num_samples'})
+        dataset.samples = [dataset.random_sample() for _ in
+                           trange(params.num_samples, desc=p.capitalize(), unit='samples', leave=True)]
+        path = folder.joinpath(p).with_suffix('.pt')
         torch.save(dataset, path)
-        tqdm.write(f'{name.capitalize()}: saved {samples} samples in\t{path}')
+        print(f'{p.capitalize()}: saved {len(dataset)} samples in: {path}')
+
+
+def describe(cfg):
+    import pandas as pd
+    target = Path(cfg.target).expanduser().resolve()
+    if target.is_dir():
+        paths = target.glob('*.pt')
+    else:
+        paths = [target]
+    for p in paths:
+        print(f"Loading dataset from: {p}")
+        dataset = torch.load(p)
+        if not isinstance(dataset, InfectionDataset):
+            raise ValueError(f'Not an InfectionDataset: {p}')
+        print(f"{p.with_suffix('').name.capitalize()} contains:\n"
+              f"min_nodes: {dataset.min_nodes}\n"
+              f"max_nodes: {dataset.max_nodes}\n"
+              f"max_percent_immune: {dataset.max_percent_immune}\n"
+              f"max_percent_sick: {dataset.max_percent_sick}\n"
+              f"node_features_shape: {dataset.node_features_shape}\n"
+              f"edge_features_shape: {dataset.edge_features_shape}\n"
+              f"samples: {len(dataset)}")
+        df = pd.DataFrame.from_records(
+            {
+                'num_nodes': g.num_nodes,
+                'num_edges': g.num_edges,
+                'degree': g.degree.float().mean().item(),
+                'infected': g.node_features[:, 0].sum().item() / g.num_nodes,
+                'immune': g.node_features[:, 1].sum().item() / g.num_nodes,
+                'infected_post': t.node_features[:, 0].sum().item() / t.num_nodes,
+            } for g, t in dataset.samples)
+        print(f'\n{df.describe()}')
+
+
+def main():
+    from argparse import ArgumentParser
+    from config import Config
+
+    parser = ArgumentParser()
+    subparsers = parser.add_subparsers()
+
+    sp_print = subparsers.add_parser('print', help='Print parsed configuration')
+    sp_print.add_argument('config', nargs='*')
+    sp_print.set_defaults(command=lambda c: print(c.toYAML()))
+
+    sp_generate = subparsers.add_parser('generate', help='Generate new datasets')
+    sp_generate.add_argument('config', nargs='*')
+    sp_generate.set_defaults(command=generate)
+
+    sp_describe = subparsers.add_parser('describe', help='Describe existing datasets')
+    sp_describe.add_argument('config', nargs='*')
+    sp_describe.set_defaults(command=describe)
+
+    args = parser.parse_args()
+    cfg = Config.build(*args.config)
+    args.command(cfg)
+
 
 if __name__ == '__main__':
-    create_and_save()
+    main()

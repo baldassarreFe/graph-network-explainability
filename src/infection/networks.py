@@ -1,6 +1,5 @@
 import torch_scatter
 
-import torch
 from torch import nn
 import torch.nn.functional as F
 
@@ -29,9 +28,9 @@ class FullGN(nn.Module):
             self.f_r(graphs.node_features).index_select(dim=0, index=graphs.receivers)
         )
         nodes = (
-            self.g_n(graphs.node_features) +
-            self.g_in(torch_scatter.scatter_max(edges, graphs.receivers, dim=0, dim_size=graphs.num_nodes)[0]) +
-            self.g_out(torch_scatter.scatter_max(edges, graphs.senders, dim=0, dim_size=graphs.num_nodes)[0])
+                self.g_n(graphs.node_features) +
+                self.g_in(torch_scatter.scatter_max(edges, graphs.receivers, dim=0, dim_size=graphs.num_nodes)[0]) +
+                self.g_out(torch_scatter.scatter_max(edges, graphs.senders, dim=0, dim_size=graphs.num_nodes)[0])
         )
         return graphs.evolve(
             node_features=nodes,
@@ -66,3 +65,35 @@ class MinimalGN(nn.Module):
             senders=None,
             receivers=None
         )
+
+
+def describe(cfg):
+    from utils import load_class
+    klass = load_class(cfg.model.klass)
+    model = klass(**cfg.model.params)
+    print(model)
+    print(f'Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
+
+
+def main():
+    from argparse import ArgumentParser
+    from config import Config
+
+    parser = ArgumentParser()
+    subparsers = parser.add_subparsers()
+
+    sp_print = subparsers.add_parser('print', help='Print parsed configuration')
+    sp_print.add_argument('config', nargs='*')
+    sp_print.set_defaults(command=lambda c: print(c.toYAML()))
+
+    sp_describe = subparsers.add_parser('describe', help='Describe a model')
+    sp_describe.add_argument('config', nargs='*')
+    sp_describe.set_defaults(command=describe)
+
+    args = parser.parse_args()
+    cfg = Config.build(*args.config)
+    args.command(cfg)
+
+
+if __name__ == '__main__':
+    main()
