@@ -37,9 +37,10 @@ For this task, the minimal version of the network should only use:
     INFECTION=~/experiments/infection/
     mkdir -p "$INFECTION/"{runs,data}
     ```
-2. Create dataset
+2. Create dataset (plus a small one for debug)
     ```bash
     python -m infection.dataset generate <dataset.yml> folder="$INFECTION/data"
+    python -m infection.dataset generate <dataset.yml> folder="$INFECTION/data" datasets.{train,val,test}.num_samples= 1000
     ```
 3. Create tensorboard layout
     ```bash
