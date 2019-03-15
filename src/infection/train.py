@@ -284,17 +284,25 @@ def train(model, optimizer, training, opts, paths, _run, _seed):
         .rename(lambda node_group_min: f'[{node_group_min * 10}, {node_group_min * 10 + 10})', axis='index') \
         .rename(str.capitalize, axis='columns', level=1)
 
-    # Split the results in ranges based on the number of nodes and compute the average loss per range
-    df_worst_best_graphs_by_node_range = stats_df \
+    # Split the results in ranges based on the number of nodes and keep the N worst predictions
+    df_worst_graphs_by_node_range = stats_df \
         .groupby(stats_df.Nodes // 10) \
-        .apply(lambda df_gr: pd.concat((df_gr.nlargest(5, 'Loss'), df_gr.nsmallest(3, 'Loss'))).set_index('GraphId')) \
+        .apply(lambda df_gr: df_gr.nlargest(5, 'Loss').set_index('GraphId')) \
+        .rename_axis(index={'Nodes': 'NodeRange'}) \
+        .rename(lambda node_group_min: f'[{node_group_min * 10}, {node_group_min * 10 + 10})', axis='index', level=0)
+
+    # Split the results in ranges based on the number of nodes and keep the N best predictions
+    df_best_graphs_by_node_range = stats_df \
+        .groupby(stats_df.Nodes // 10) \
+        .apply(lambda df_gr: df_gr.nsmallest(3, 'Loss').set_index('GraphId')) \
         .rename_axis(index={'Nodes': 'NodeRange'}) \
         .rename(lambda node_group_min: f'[{node_group_min * 10}, {node_group_min * 10 + 10})', axis='index', level=0)
 
     print('',
           df_train_test.to_string(float_format=lambda x: f'{x:.2f}'),
           df_losses_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'),
-          df_worst_best_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'),
+          df_best_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'),
+          df_worst_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'),
           sep='\n\n')
 
     if logger is not None:
@@ -307,8 +315,12 @@ def train(model, optimizer, training, opts, paths, _run, _seed):
             textwrap.indent(df_losses_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
             global_step=ex.info['samples'])
         logger.add_text(
-            'Samples',
-            textwrap.indent(df_worst_best_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
+            'Best predictions',
+            textwrap.indent(df_best_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
+            global_step=ex.info['samples'])
+        logger.add_text(
+            'Worst predictions',
+            textwrap.indent(df_worst_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
             global_step=ex.info['samples'])
 
     params = [f'{name}:\n{param.data.cpu().numpy().round(3)}' for name, param in model.named_parameters()]
