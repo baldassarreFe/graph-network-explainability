@@ -198,10 +198,15 @@ def train(model, optimizer, training, opts, paths, _run, _seed):
         epoch_bar.set_postfix(epoch_bar_postfix)
     epoch_bar.close()
 
+    dataset_train_max_nodes = dataloader_train.dataset.max_nodes
+    dataset_train_min_nodes = dataloader_train.dataset.min_nodes
+
+    del dataloader_train, dataloader_val, optimizer
     dataloader_test = get_dataloader('test', paths, training, opts, shuffle=False)
 
     model.eval()
-    df = {k: [] for k in ['Loss', 'Nodes', 'Edges', 'Predict', 'Target']}
+    stats_df = {k: [] for k in ['Loss', 'Nodes', 'Edges', 'Predict', 'Target']}
+    huge_dict = {'targets': [], 'results': []}
     with torch.no_grad():
         with tqdm.tqdm(desc='Test', total=len(dataloader_test.dataset), leave=True, unit='g') as bar:
             for graphs, targets in dataloader_test:
@@ -214,39 +219,57 @@ def train(model, optimizer, training, opts, paths, _run, _seed):
                 idx = tg.utils.segment_lengths_to_ids(graphs.num_nodes_by_graph)
                 losses_by_graph = torch_scatter.scatter_mean(losses, index=idx, dim=0, dim_size=graphs.num_graphs)
 
-                df['Loss'].append(losses_by_graph.cpu())
-                df['Nodes'].append(graphs.num_nodes_by_graph.cpu())
-                df['Edges'].append(graphs.num_edges_by_graph.cpu())
-                df['Target'].append(torch_scatter.scatter_add(
+                huge_dict['targets'].append(targets.int().cpu().numpy())
+                huge_dict['results'].append(targets.sigmoid().cpu().numpy())
+
+                stats_df['Loss'].append(losses_by_graph.cpu())
+                stats_df['Nodes'].append(graphs.num_nodes_by_graph.cpu())
+                stats_df['Edges'].append(graphs.num_edges_by_graph.cpu())
+                stats_df['Target'].append(torch_scatter.scatter_add(
                     targets.int(), index=idx, dim=0, dim_size=graphs.num_graphs).cpu())
-                df['Predict'].append(torch_scatter.scatter_add(
+                stats_df['Predict'].append(torch_scatter.scatter_add(
                     results.sigmoid(), index=idx, dim=0, dim_size=graphs.num_graphs).cpu())
 
                 bar.update(graphs.num_graphs)
                 bar.set_postfix_str(f'Loss: {losses.mean().item():.9f}')
-    df = pd.DataFrame({k: np.concatenate(v) for k, v in df.items()}).rename_axis('GraphId').reset_index()
+
+    dataset_test_max_nodes = dataloader_test.dataset.max_nodes
+    del dataloader_test
+
+    import sklearn.metrics
+    targets = np.concatenate(huge_dict['targets'])
+    results = np.concatenate(huge_dict['results'])
+    del huge_dict
+    average_precision = sklearn.metrics.average_precision_score(targets, results)
+    print(average_precision)
+    if logger is not None:
+        logger.add_scalar('test/avg_precision', average_precision, global_step=_run.info['samples'])
+        logger.add_pr_curve('test/pr_curve', labels=targets, predictions=results, global_step=_run.info['samples'])
+    del targets, results
+
+    stats_df = pd.DataFrame({k: np.concatenate(v) for k, v in stats_df.items()}).rename_axis('GraphId').reset_index()
 
     # Split the results based on whether the number of nodes was present in the training set or not
-    df_train_test = df \
-        .groupby(np.where(df.Nodes < dataloader_train.dataset.max_nodes,
-                          f'Train [{dataloader_train.dataset.min_nodes}, {dataloader_train.dataset.max_nodes - 1})',
-                          f'Test  [{dataloader_train.dataset.max_nodes}, {dataloader_test.dataset.max_nodes - 1})')) \
+    df_train_test = stats_df \
+        .groupby(np.where(stats_df.Nodes < dataset_train_max_nodes,
+                          f'Train [{dataset_train_min_nodes}, {dataset_train_max_nodes - 1})',
+                          f'Test  [{dataset_train_max_nodes}, {dataset_test_max_nodes - 1})')) \
         .agg({'Nodes': ['min', 'max'], 'GraphId': 'count', 'Loss': 'mean'}) \
         .sort_index(ascending=False) \
         .rename_axis(index='Dataset') \
         .rename(str.capitalize, axis='columns', level=1)
 
     # Split the results in ranges based on the number of nodes and compute the average loss per range
-    df_losses_by_node_range = df \
-        .groupby(df.Nodes // 10) \
+    df_losses_by_node_range = stats_df \
+        .groupby(stats_df.Nodes // 10) \
         .agg({'Nodes': ['min', 'max'], 'GraphId': 'count', 'Loss': 'mean'}) \
         .rename_axis(index='NodeRange') \
         .rename(lambda node_group_min: f'[{node_group_min * 10}, {node_group_min * 10 + 10})', axis='index') \
         .rename(str.capitalize, axis='columns', level=1)
 
     # Split the results in ranges based on the number of nodes and compute the average loss per range
-    df_worst_best_graphs_by_node_range = df \
-        .groupby(df.Nodes // 10) \
+    df_worst_best_graphs_by_node_range = stats_df \
+        .groupby(stats_df.Nodes // 10) \
         .apply(lambda df_gr: pd.concat((df_gr.nlargest(5, 'Loss'), df_gr.nsmallest(3, 'Loss'))).set_index('GraphId')) \
         .rename_axis(index={'Nodes': 'NodeRange'}) \
         .rename(lambda node_group_min: f'[{node_group_min * 10}, {node_group_min * 10 + 10})', axis='index', level=0)
@@ -278,3 +301,5 @@ def train(model, optimizer, training, opts, paths, _run, _seed):
 
     if logger is not None:
         logger.close()
+
+    return average_precision
