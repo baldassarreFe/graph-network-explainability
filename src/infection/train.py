@@ -24,6 +24,7 @@ from saver import Saver
 from utils import load_class
 from .dataset import InfectionDataset
 
+# region Sacred experiment set up
 ex = Experiment('infection')
 ex.captured_out_filter = apply_backspaces_and_linefeeds
 
@@ -72,8 +73,10 @@ def cfg_hook(config, command_name, logger):
     if command_name != 'print_config' and config['opts']['log_every'] != '_never_':
         ex.observers.append(FileStorageObserver.create(updates['runs']))
     return dict(paths={n: p.as_posix() for n, p in updates.items()})
+# endregion
 
 
+# region Setup and helper functions
 def set_seeds(_seed):
     random.seed(_seed)
     np.random.seed(_seed)
@@ -124,6 +127,7 @@ def get_dataloader(name, paths, training, opts, shuffle):
         pin_memory='cuda' in str(opts['device']),
         worker_init_fn=lambda _: np.random.seed(int(torch.initial_seed()) % (2 ** 32 - 1))
     )
+# endregion
 
 
 @ex.automain
@@ -146,7 +150,7 @@ def train(model, optimizer, training, opts, paths, _run, _seed):
     epoch_end = _run.info['epochs'] + 1 + training['epochs']
     epoch_bar = tqdm.trange(epoch_start, epoch_end, desc='Training', unit='e', leave=True)
     for epoch in epoch_bar:
-        # Training loop
+        # region Training loop
         model.train()
         losses_batch = 0
         with tqdm.tqdm(desc=f'Train {epoch}', total=len(dataloader_train.dataset), unit='g') as bar:
@@ -155,7 +159,7 @@ def train(model, optimizer, training, opts, paths, _run, _seed):
                 targets = targets.node_features.squeeze().to(opts['device'])
 
                 results = model(graphs).node_features.squeeze()
-                loss = F.binary_cross_entropy_with_logits(results, targets, reduction='mean')
+                loss = F.binary_cross_entropy_with_logits(results, targets.float(), reduction='mean')
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -171,13 +175,14 @@ def train(model, optimizer, training, opts, paths, _run, _seed):
                     _run.log_scalar('loss/train', loss.item(), step=_run.info['samples'])
         epoch_bar_postfix['Train'] = f'{losses_batch / len(dataloader_train.dataset):.4f}'
         epoch_bar.set_postfix(epoch_bar_postfix)
+        # endregion
 
         # Saving
         _run.info['epochs'] += 1
         if should_save(_run.info['epochs']):
             saver.save(id_=epoch, model=model, optimizer=optimizer, **_run.info)
 
-        # Validation loop
+        # region Validation loop
         model.eval()
         losses_batch = 0
         with torch.no_grad():
@@ -187,7 +192,7 @@ def train(model, optimizer, training, opts, paths, _run, _seed):
                     targets = targets.node_features.squeeze().to(opts['device'])
 
                     results = model(graphs).node_features.squeeze()
-                    loss = F.binary_cross_entropy_with_logits(results, targets, reduction='mean')
+                    loss = F.binary_cross_entropy_with_logits(results, targets.float(), reduction='mean')
 
                     losses_batch += loss.item() * graphs.num_graphs
                     bar.update(graphs.num_graphs)
@@ -197,15 +202,16 @@ def train(model, optimizer, training, opts, paths, _run, _seed):
             _run.log_scalar('loss/val', losses_batch / len(dataloader_val.dataset), step=_run.info['samples'])
         epoch_bar_postfix['Val'] = f'{losses_batch / len(dataloader_val.dataset):.4f}'
         epoch_bar.set_postfix(epoch_bar_postfix)
+        # endregion
     epoch_bar.close()
 
     dataset_train_max_nodes = dataloader_train.dataset.max_nodes
     dataset_train_min_nodes = dataloader_train.dataset.min_nodes
-
     del dataloader_train, dataloader_val, optimizer
-    dataloader_test = get_dataloader('test', paths, training, opts, shuffle=False)
 
+    # region Testing
     model.eval()
+    dataloader_test = get_dataloader('test', paths, training, opts, shuffle=False)
     stats_df = {k: [] for k in ['Loss', 'Nodes', 'Edges', 'Predict', 'Target', 'AvgPrecision', 'AreaROC']}
     huge_dict = {'targets': [], 'results': []}
     with torch.no_grad():
@@ -216,51 +222,68 @@ def train(model, optimizer, training, opts, paths, _run, _seed):
 
                 results = model(graphs)
                 losses = F.binary_cross_entropy_with_logits(
-                    results.node_features.squeeze(), targets.node_features.squeeze(), reduction='none')
+                    results.node_features.squeeze(), targets.node_features.squeeze().float(), reduction='none')
 
                 idx = tg.utils.segment_lengths_to_ids(graphs.num_nodes_by_graph)
                 losses_by_graph = torch_scatter.scatter_mean(
                     losses, index=idx, dim=0, dim_size=graphs.num_graphs)
                 infected_by_graph_true = torch_scatter.scatter_add(
-                    targets.node_features.squeeze().int(), index=idx, dim=0, dim_size=graphs.num_graphs)
+                    targets.node_features.squeeze(), index=idx, dim=0, dim_size=graphs.num_graphs)
                 infected_by_graph_pred = torch_scatter.scatter_add(
                     results.node_features.squeeze().sigmoid(), index=idx, dim=0, dim_size=graphs.num_graphs)
                 avg_prec_by_graph = []
                 area_roc_by_graph = []
                 for t, r in zip(targets.node_features_by_graph, results.node_features_by_graph):
+                    # numpy does not work with torch.int8
                     avg_prec_by_graph.append(sklearn.metrics.average_precision_score(
-                        y_true=t.int().cpu(), y_score=r.sigmoid().cpu()))
+                        y_true=t.squeeze().cpu().int(),  # numpy does not work with torch.int8
+                        y_score=r.squeeze().sigmoid().cpu())
+                    )
                     try:
                         area_roc_by_graph.append(sklearn.metrics.roc_auc_score(
-                            y_true=t.squeeze().int().cpu(), y_score=r.sigmoid().cpu()))
+                            y_true=t.squeeze().cpu().int(),  # numpy does not work with torch.int8
+                            y_score=r.squeeze().sigmoid().cpu())
+                        )
                     except ValueError:
                         # ValueError: Only one class present in y_true. ROC AUC score is not defined in that case.
                         area_roc_by_graph.append(np.nan)
 
-                huge_dict['targets'].append(targets.node_features.squeeze().int().cpu())
-                huge_dict['results'].append(targets.node_features.squeeze().sigmoid().cpu())
+                huge_dict['targets'].append(targets.node_features.squeeze().cpu())
+                huge_dict['results'].append(results.node_features.squeeze().sigmoid().cpu())
 
                 stats_df['Loss'].append(losses_by_graph.cpu())
                 stats_df['Nodes'].append(graphs.num_nodes_by_graph.cpu())
                 stats_df['Edges'].append(graphs.num_edges_by_graph.cpu())
-                stats_df['Target'].append(infected_by_graph_true.cpu())
+                stats_df['Target'].append(infected_by_graph_true.cpu().int())  # numpy does not work with torch.int8
                 stats_df['Predict'].append(infected_by_graph_pred.cpu())
                 stats_df['AvgPrecision'].append(np.array(avg_prec_by_graph))
                 stats_df['AreaROC'].append(np.array(area_roc_by_graph))
 
                 bar.update(graphs.num_graphs)
                 bar.set_postfix_str(f'Loss: {losses.mean().item():.9f}')
-
     dataset_test_max_nodes = dataloader_test.dataset.max_nodes
     del dataloader_test
+    # endregion
 
-    targets = np.concatenate(huge_dict['targets'])
-    results = np.concatenate(huge_dict['results'])
+    # region Final report
+    targets = torch.cat(huge_dict['targets']).int()  # numpy does not work with torch.int8
+    results = torch.cat(huge_dict['results'])
     del huge_dict
-    average_precision = sklearn.metrics.average_precision_score(targets, results)
-    print(average_precision)
+    _run.info['average_precision'] = sklearn.metrics.average_precision_score(y_true=targets, y_score=results)
+    print('Average precision:', _run.info['average_precision'])
+    if False:
+        import matplotlib.pyplot as plt
+        precision, recall, _ = sklearn.metrics.precision_recall_curve(y_true=targets, probas_pred=results)
+        plt.step(recall, precision, color='b', alpha=0.2, where='post')
+        plt.fill_between(recall, precision, alpha=0.2, color='b', step='post')
+        plt.xlabel('Recall')
+        plt.ylabel('Precision')
+        plt.ylim([0.0, 1.05])
+        plt.xlim([0.0, 1.0])
+        plt.title(f'Precision-Recall curve: AP={_run.info["average_precision"]:.2f}')
+        plt.show()
     if logger is not None:
-        logger.add_scalar('test/avg_precision', average_precision, global_step=_run.info['samples'])
+        logger.add_scalar('test/avg_precision', _run.info['average_precision'], global_step=_run.info['samples'])
         logger.add_pr_curve('test/pr_curve', labels=targets, predictions=results, global_step=_run.info['samples'])
     del targets, results
 
@@ -327,8 +350,9 @@ def train(model, optimizer, training, opts, paths, _run, _seed):
     print('Parameters:', *params, sep='\n\n')
     if logger is not None:
         logger.add_text('Parameters', textwrap.indent('\n\n'.join(params), '    '), global_step=ex.info['samples'])
+    # endregion
 
     if logger is not None:
         logger.close()
 
-    return average_precision
+    return _run.info['average_precision']
