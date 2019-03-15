@@ -11,12 +11,13 @@ import torch.nn.functional as F
 import arrow
 import numpy as np
 import pandas as pd
+import sklearn.metrics
 import torch_scatter
 import torchgraphs as tg
 
 from sacred import Experiment
 from sacred.observers import RunObserver
-from sacred.observers.file_storage import FileStorageObserver, DEFAULT_FILE_STORAGE_PRIORITY
+from sacred.observers.file_storage import FileStorageObserver
 from sacred.utils import apply_backspaces_and_linefeeds
 
 from saver import Saver
@@ -205,30 +206,47 @@ def train(model, optimizer, training, opts, paths, _run, _seed):
     dataloader_test = get_dataloader('test', paths, training, opts, shuffle=False)
 
     model.eval()
-    stats_df = {k: [] for k in ['Loss', 'Nodes', 'Edges', 'Predict', 'Target']}
+    stats_df = {k: [] for k in ['Loss', 'Nodes', 'Edges', 'Predict', 'Target', 'AvgPrecision', 'AreaROC']}
     huge_dict = {'targets': [], 'results': []}
     with torch.no_grad():
         with tqdm.tqdm(desc='Test', total=len(dataloader_test.dataset), leave=True, unit='g') as bar:
             for graphs, targets in dataloader_test:
                 graphs = graphs.to(opts['device'])
-                targets = targets.node_features.squeeze().to(opts['device'])
+                targets = targets.to(opts['device'])
 
-                results = model(graphs).node_features.squeeze()
-                losses = F.binary_cross_entropy_with_logits(results, targets, reduction='none')
+                results = model(graphs)
+                losses = F.binary_cross_entropy_with_logits(
+                    results.node_features.squeeze(), targets.node_features.squeeze(), reduction='none')
 
                 idx = tg.utils.segment_lengths_to_ids(graphs.num_nodes_by_graph)
-                losses_by_graph = torch_scatter.scatter_mean(losses, index=idx, dim=0, dim_size=graphs.num_graphs)
+                losses_by_graph = torch_scatter.scatter_mean(
+                    losses, index=idx, dim=0, dim_size=graphs.num_graphs)
+                infected_by_graph_true = torch_scatter.scatter_add(
+                    targets.node_features.squeeze().int(), index=idx, dim=0, dim_size=graphs.num_graphs)
+                infected_by_graph_pred = torch_scatter.scatter_add(
+                    results.node_features.squeeze().sigmoid(), index=idx, dim=0, dim_size=graphs.num_graphs)
+                avg_prec_by_graph = []
+                area_roc_by_graph = []
+                for t, r in zip(targets.node_features_by_graph, results.node_features_by_graph):
+                    avg_prec_by_graph.append(sklearn.metrics.average_precision_score(
+                        y_true=t.int().cpu(), y_score=r.sigmoid().cpu()))
+                    try:
+                        area_roc_by_graph.append(sklearn.metrics.roc_auc_score(
+                            y_true=t.squeeze().int().cpu(), y_score=r.sigmoid().cpu()))
+                    except ValueError:
+                        # ValueError: Only one class present in y_true. ROC AUC score is not defined in that case.
+                        area_roc_by_graph.append(np.nan)
 
-                huge_dict['targets'].append(targets.int().cpu().numpy())
-                huge_dict['results'].append(targets.sigmoid().cpu().numpy())
+                huge_dict['targets'].append(targets.node_features.squeeze().int().cpu())
+                huge_dict['results'].append(targets.node_features.squeeze().sigmoid().cpu())
 
                 stats_df['Loss'].append(losses_by_graph.cpu())
                 stats_df['Nodes'].append(graphs.num_nodes_by_graph.cpu())
                 stats_df['Edges'].append(graphs.num_edges_by_graph.cpu())
-                stats_df['Target'].append(torch_scatter.scatter_add(
-                    targets.int(), index=idx, dim=0, dim_size=graphs.num_graphs).cpu())
-                stats_df['Predict'].append(torch_scatter.scatter_add(
-                    results.sigmoid(), index=idx, dim=0, dim_size=graphs.num_graphs).cpu())
+                stats_df['Target'].append(infected_by_graph_true.cpu())
+                stats_df['Predict'].append(infected_by_graph_pred.cpu())
+                stats_df['AvgPrecision'].append(np.array(avg_prec_by_graph))
+                stats_df['AreaROC'].append(np.array(area_roc_by_graph))
 
                 bar.update(graphs.num_graphs)
                 bar.set_postfix_str(f'Loss: {losses.mean().item():.9f}')
@@ -236,7 +254,6 @@ def train(model, optimizer, training, opts, paths, _run, _seed):
     dataset_test_max_nodes = dataloader_test.dataset.max_nodes
     del dataloader_test
 
-    import sklearn.metrics
     targets = np.concatenate(huge_dict['targets'])
     results = np.concatenate(huge_dict['results'])
     del huge_dict
