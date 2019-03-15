@@ -45,7 +45,7 @@ class InfectionDataset(torch.utils.data.Dataset):
 
         g = tg.Graph.from_networkx(g_nx).evolve(node_features=node_features, edge_features=edge_features)
 
-        target = node_features.new_zeros(size=(num_nodes, 1))
+        target = torch.zeros((num_nodes, 1), dtype=torch.int8)
         target[sick] = 1
         target[list({n for s in sick for n in g_nx.neighbors(s) if n not in immune})] = 1
         target = tg.Graph(node_features=target)
