@@ -3,5 +3,5 @@ model:
   params:
     in_edge_features_shape: 2
     in_node_features_shape: 4
-    out_edge_features_shape: 2
+    out_edge_features_shape: 1
     out_node_features_shape: 1

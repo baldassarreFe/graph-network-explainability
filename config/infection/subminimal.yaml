@@ -1,5 +1,5 @@
 model:
-  klass: infection.networks.FullGN
+  klass: infection.networks.SubMinimalGN
   params:
     in_edge_features_shape: 2
     in_node_features_shape: 4

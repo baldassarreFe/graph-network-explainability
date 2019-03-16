@@ -60,10 +60,10 @@ For this task, the minimal version of the network should only use:
     python -m infection.train -m <dbaddr:dbport>:sacred with <model.yaml> <train.yaml> [<other config>]
 
     conda activate tg-experiments
-    for i in $(seq  0 9); do
-       for type in full minimal; do
+    for i in $(seq  0 2); do
+       for type in subminimal minimal full; do
            for lr in .01 .001; do
-               for wd in 0 .01 .001; do
+               for wd in 0 .001; do
                    python -m infection.train \
                        -m 172.17.0.2:27017:sacred \
                        with ../config/infection/{train,${type}}.yaml \
