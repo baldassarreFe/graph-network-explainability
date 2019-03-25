@@ -78,7 +78,7 @@ for string in args.model:
     else:
         with open(string, 'r') as f:
             update = yaml.safe_load(f)
-            # If the yaml file contains a single entry with key `model` use that one instead
+            # If the yaml document contains a single entry with key `model` use that one instead
             if update.keys() == {'model'}:
                 update = update['model']
     update_rec(experiment.model, update)
@@ -90,7 +90,7 @@ for string in args.optimizer:
     else:
         with open(string, 'r') as f:
             update = yaml.safe_load(f)
-            # If the yaml file contains a single entry with key `optimizer` use that one instead
+            # If the yaml document contains a single entry with key `optimizer` use that one instead
             if update.keys() == {'optimizer'}:
                 update = update['optimizer']
     update_rec(experiment.optimizer, update)
@@ -102,7 +102,7 @@ for string in args.session:
     else:
         with open(string, 'r') as f:
             update = yaml.safe_load(f)
-            # If the yaml file contains a single entry with key `session` use that one instead
+            # If the yaml document contains a single entry with key `session` use that one instead
             if update.keys() == {'session'}:
                 update = update['session']
     update_rec(session, update)
