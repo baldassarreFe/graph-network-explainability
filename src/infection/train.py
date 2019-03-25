@@ -196,7 +196,6 @@ else:
     saver = None
 # endregion
 
-# region Training
 # Datasets and dataloaders
 dataloader_kwargs = dict(
     num_workers=min(experiment.session.cpus, 1) if 'cuda' in experiment.session.device else experiment.session.cpus,
@@ -218,6 +217,7 @@ dataloader_val = torch.utils.data.DataLoader(
     **dataloader_kwargs
 )
 
+# region Training
 # Train and validation loops
 experiment.session.status = 'RUNNING'
 experiment.session.datetime_started = datetime.utcnow()

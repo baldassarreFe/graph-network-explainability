@@ -1,5 +1,8 @@
+import math
+
 import torch_scatter
 
+import torch
 from torch import nn
 import torch.nn.functional as F
 
@@ -13,24 +16,33 @@ class FullGN(nn.Module):
             out_edge_features_shape, out_node_features_shape
     ):
         super().__init__()
-        self.f_e = nn.Linear(in_edge_features_shape, out_edge_features_shape)
-        self.f_s = nn.Linear(in_node_features_shape, out_edge_features_shape)
-        self.f_r = nn.Linear(in_node_features_shape, out_edge_features_shape)
 
-        self.g_n = nn.Linear(in_node_features_shape, out_node_features_shape)
-        self.g_in = nn.Linear(out_edge_features_shape, out_node_features_shape)
-        self.g_out = nn.Linear(out_edge_features_shape, out_node_features_shape)
+        self.f_edge = nn.Parameter(torch.Tensor(out_edge_features_shape, in_edge_features_shape))
+        self.f_sender = nn.Parameter(torch.Tensor(out_edge_features_shape, in_node_features_shape))
+        self.f_receiver = nn.Parameter(torch.Tensor(out_edge_features_shape, in_node_features_shape))
+        self.f_bias = nn.Parameter(torch.Tensor(out_edge_features_shape))
+
+        self.g_node = nn.Parameter(torch.Tensor(out_node_features_shape, in_node_features_shape))
+        self.g_in = nn.Parameter(torch.Tensor(out_node_features_shape, out_edge_features_shape))
+        self.g_out = nn.Parameter(torch.Tensor(out_node_features_shape, out_edge_features_shape))
+        self.g_bias = nn.Parameter(torch.Tensor(out_node_features_shape))
+
+        _reset_parameters(self)
 
     def forward(self, graphs: tg.GraphBatch):
         edges = F.relu(
-            self.f_e(graphs.edge_features) +
-            self.f_s(graphs.node_features).index_select(dim=0, index=graphs.senders) +
-            self.f_r(graphs.node_features).index_select(dim=0, index=graphs.receivers)
+            graphs.edge_features @ self.f_edge.t() +
+            (graphs.node_features @ self.f_sender.t()).index_select(dim=0, index=graphs.senders) +
+            (graphs.node_features @ self.f_receiver.t()).index_select(dim=0, index=graphs.receivers) +
+            self.f_bias
         )
+        incoming_edges_agg = (torch_scatter.scatter_max(edges, graphs.receivers, dim=0, dim_size=graphs.num_nodes)[0])
+        outgoing_edges_agg = (torch_scatter.scatter_max(edges, graphs.senders, dim=0, dim_size=graphs.num_nodes)[0])
         nodes = (
-                self.g_n(graphs.node_features) +
-                self.g_in(torch_scatter.scatter_max(edges, graphs.receivers, dim=0, dim_size=graphs.num_nodes)[0]) +
-                self.g_out(torch_scatter.scatter_max(edges, graphs.senders, dim=0, dim_size=graphs.num_nodes)[0])
+                graphs.node_features @ self.g_node.t() +
+                incoming_edges_agg @ self.g_in.t() +
+                outgoing_edges_agg @ self.g_out.t() +
+                self.g_bias
         )
         return graphs.evolve(
             node_features=nodes,
@@ -50,15 +62,26 @@ class MinimalGN(nn.Module):
             out_edge_features_shape, out_node_features_shape
     ):
         super().__init__()
-        self.f_s = nn.Linear(in_node_features_shape, out_edge_features_shape)
-        self.g_n = nn.Linear(in_node_features_shape, out_node_features_shape)
-        self.g_in = nn.Linear(out_edge_features_shape, out_node_features_shape)
+
+        self.f_sender = nn.Parameter(torch.Tensor(out_edge_features_shape, in_node_features_shape))
+        self.f_bias = nn.Parameter(torch.Tensor(out_edge_features_shape))
+
+        self.g_node = nn.Parameter(torch.Tensor(out_node_features_shape, in_node_features_shape))
+        self.g_in = nn.Parameter(torch.Tensor(out_node_features_shape, out_edge_features_shape))
+        self.g_bias = nn.Parameter(torch.Tensor(out_node_features_shape))
+
+        _reset_parameters(self)
 
     def forward(self, graphs: tg.GraphBatch):
-        edges = F.relu(self.f_s(graphs.node_features).index_select(dim=0, index=graphs.senders))
+        edges = F.relu(
+            (graphs.node_features @ self.f_sender.t()).index_select(dim=0, index=graphs.senders) +
+            self.f_bias
+        )
+        incoming_edges_agg = (torch_scatter.scatter_max(edges, graphs.receivers, dim=0, dim_size=graphs.num_nodes)[0])
         nodes = (
-                self.g_n(graphs.node_features) +
-                self.g_in(torch_scatter.scatter_max(edges, graphs.receivers, dim=0, dim_size=graphs.num_nodes)[0])
+                graphs.node_features @ self.g_node.t() +
+                incoming_edges_agg @ self.g_in.t() +
+                self.g_bias
         )
         return graphs.evolve(
             node_features=nodes,
@@ -78,12 +101,25 @@ class SubMinimalGN(nn.Module):
             out_edge_features_shape, out_node_features_shape
     ):
         super().__init__()
-        self.f_s = nn.Linear(in_node_features_shape, out_edge_features_shape)
-        self.g_in = nn.Linear(out_edge_features_shape, out_node_features_shape)
+
+        self.f_sender = nn.Parameter(torch.Tensor(out_edge_features_shape, in_node_features_shape))
+        self.f_bias = nn.Parameter(torch.Tensor(out_edge_features_shape))
+
+        self.g_in = nn.Parameter(torch.Tensor(out_node_features_shape, out_edge_features_shape))
+        self.g_bias = nn.Parameter(torch.Tensor(out_node_features_shape))
+
+        _reset_parameters(self)
 
     def forward(self, graphs: tg.GraphBatch):
-        edges = F.relu(self.f_s(graphs.node_features).index_select(dim=0, index=graphs.senders))
-        nodes = self.g_in(torch_scatter.scatter_max(edges, graphs.receivers, dim=0, dim_size=graphs.num_nodes)[0])
+        edges = F.relu(
+            (graphs.node_features @ self.f_sender.t()).index_select(dim=0, index=graphs.senders) +
+            self.f_bias
+        )
+        incoming_edges_agg = (torch_scatter.scatter_max(edges, graphs.receivers, dim=0, dim_size=graphs.num_nodes)[0])
+        nodes = (
+                incoming_edges_agg @ self.g_in.t() +
+                self.g_bias
+        )
         return graphs.evolve(
             node_features=nodes,
             num_edges=0,
@@ -95,12 +131,30 @@ class SubMinimalGN(nn.Module):
         )
 
 
+def _reset_parameters(gn):
+    for name, param in gn.named_parameters():
+        if 'bias' in name:
+            bound = 1 / math.sqrt(param.numel())
+            nn.init.uniform_(param, -bound, bound)
+        else:
+            nn.init.kaiming_uniform_(param, a=math.sqrt(5))
+
+
 def describe(cfg):
-    from utils import load_class
-    klass = load_class(cfg.model.klass)
-    model = klass(**cfg.model.params)
+    from pathlib import Path
+    from utils import import_
+    klass = import_(cfg.model.klass)
+    model = klass(*cfg.model.args, **cfg.model.kwargs)
+    if 'state_dict' in cfg:
+        model.load_state_dict(torch.load(Path(cfg.state_dict).expanduser().resolve()))
     print(model)
     print(f'Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
+
+    for name, parameter in model.named_parameters():
+        print(f'{name} {tuple(parameter.shape)}:')
+        if 'state_dict' in cfg:
+            print(parameter.numpy().round())
+            print()
 
 
 def main():
