@@ -1,6 +1,6 @@
 model:
-  klass: infection.networks.SubMinimalGN
-  params:
+  fn: infection.networks.SubMinimalGN
+  kwargs:
     in_edge_features_shape: 2
     in_node_features_shape: 4
     out_edge_features_shape: 1

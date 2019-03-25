@@ -7,13 +7,9 @@ datasets:
     num_samples: 100_000
   val:
     min_nodes: 10
-    max_nodes: 30
-    max_percent_sick: .1
-    max_percent_immune: .3
-    num_samples: 100_000
-  test:
-    min_nodes: 10
     max_nodes: 60
     max_percent_sick: .4
     max_percent_immune: .6
-    num_samples: 100_000
+    num_samples: 20_000
+
+folder: ~/experiments/infection/data

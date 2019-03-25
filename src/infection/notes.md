@@ -39,8 +39,8 @@ For this task, the minimal version of the network should only use:
     ```
 2. Create dataset (plus a small one for debug)
     ```bash
-    python -m infection.dataset generate <dataset.yml> folder="$INFECTION/data"
-    python -m infection.dataset generate <dataset.yml> folder="$INFECTION/data" datasets.{train,val,test}.num_samples= 1000
+    python -m infection.dataset generate <dataset.yml> "folder=${INFECTION}/data"
+    python -m infection.dataset generate <dataset.yml> "folder=${INFECTION}/smalldata" datasets.{train,val}.num_samples=5000
     ```
 3. Create tensorboard layout
     ```bash
@@ -57,22 +57,20 @@ For this task, the minimal version of the network should only use:
    
 5. Launch experiments
     ```bash
-    python -m infection.train -m <dbaddr:dbport>:sacred with <model.yaml> <train.yaml> [<other config>]
-
+    python -m infection.train \
+       --experiment ../config/infection/train.yaml \
+       --model ../config/infection/minimal.yaml
+       
     conda activate tg-experiments
     for i in $(seq  0 2); do
        for type in subminimal minimal full; do
            for lr in .01 .001; do
                for wd in 0 .001; do
-                   python -m infection.train \
-                       -m 172.17.0.2:27017:sacred \
-                       with ../config/infection/{train,${type}}.yaml \
-                       paths.root=~/experiments/infection \
-                       opts.session=${type}_lr${lr}_wd${wd}_${i} \
-                       optimizer.lr=${lr} \
-                       training.l1=${wd} \
-                       training.epochs=20 \
-                       training.batch_size=1000
+                    python -m infection.train \
+                       --experiment ../config/infection/train.yaml "tags=[${type},lr${lr}.wd${wd}]" \
+                       --model "../config/infection/${type}.yaml" \
+                       --optimizer "kwargs.lr=${lr}" \
+                       --session "l1=${wd}"
                done
            done
        done

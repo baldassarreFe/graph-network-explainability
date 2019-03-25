@@ -1,4 +1,3 @@
-import contextlib
 from collections import Mapping, defaultdict
 from pathlib import Path
 from typing import Union
@@ -65,4 +64,4 @@ class Config(munch.Munch):
             if k in old_config and isinstance(old_config[k], Mapping) and isinstance(new_config[k], Mapping):
                 Config._update_rec(old_config[k], new_config[k])
             else:
-                old_config[k] = new_config[k]
+                setattr(old_config, k, new_config[k])

@@ -1,6 +1,6 @@
 model:
-  klass: infection.networks.FullGN
-  params:
+  fn: infection.networks.FullGN
+  kwargs:
     in_edge_features_shape: 2
     in_node_features_shape: 4
     out_edge_features_shape: 1

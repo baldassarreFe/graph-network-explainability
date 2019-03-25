@@ -1,14 +1,22 @@
-training:
-  batch_size: 1_000
-  epochs: 20
-  restore: False
-
-opts:
-  log_every: _batch_
-  save_every: _never_
+name: infection
 
 optimizer:
-  klass: torch.optim.Adam
-  params:
+  fn: torch.optim.Adam
+  kwargs:
     lr: .001
 
+session:
+  epochs: 20
+  batch_size: 1_000
+  data:
+    folder: ~/experiments/{name}/data
+  log:
+    folder: ~/experiments/{name}/runs/{tags}_{rand}
+    when:
+      - every batch
+  checkpoint:
+    folder: ~/experiments/{name}/runs/{tags}_{rand}
+    when:
+      - every epoch
+      - last epoch
+      - improvement

@@ -151,7 +151,7 @@ for epoch in epoch_bar:
     # Saving
     train_state.epochs += 1
     if config.training.save_every > 0 and epoch % config.training.save_every == 0:
-        saver.save(id_=epoch, model=net, optimizer=optimizer, **train_state)
+        saver.save(name=epoch, model=net, optimizer=optimizer, **train_state)
 
     # Validation loop
     net.eval()

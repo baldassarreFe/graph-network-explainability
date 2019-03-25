@@ -1,228 +1,283 @@
 import tqdm
-import socket
+import yaml
+import pyaml
 import random
 import textwrap
 import multiprocessing
 from pathlib import Path
+from datetime import datetime
+from argparse import ArgumentParser
+
+import numpy as np
+import pandas as pd
+import sklearn.metrics
+from munch import AutoMunch
 
 import torch
 import torch.utils.data
 import torch.nn.functional as F
-import arrow
-import numpy as np
-import pandas as pd
-import sklearn.metrics
 import torch_scatter
 import torchgraphs as tg
-
-from sacred import Experiment
-from sacred.observers import RunObserver
-from sacred.observers.file_storage import FileStorageObserver
-from sacred.utils import apply_backspaces_and_linefeeds
+from tensorboardX import SummaryWriter
 
 from saver import Saver
-from utils import load_class
+from utils import git_info, cuda_info, parse_dotted, update_rec, set_seeds, import_, sort_dict, RunningWeightedAverage
 from .dataset import InfectionDataset
 
-# region Sacred experiment set up
-ex = Experiment('infection')
-ex.captured_out_filter = apply_backspaces_and_linefeeds
+parser = ArgumentParser()
+parser.add_argument('--experiment', nargs='+', required=True)
+parser.add_argument('--model', nargs='+', required=False, default=[])
+parser.add_argument('--optimizer', nargs='+', required=False, default=[])
+parser.add_argument('--session', nargs='+', required=False, default=[])
+
+args = parser.parse_args()
 
 
-class RunIdHack(RunObserver):
-    # The run id is assigned by the first observer that handles the started event,
-    # this hack makes sure that the run id matches the session name from the config
-    def __init__(self, run_id):
-        self.run_id = run_id
-        self.priority = 1_000_000
-
-    def started_event(self, ex_info, command, host_info, start_time, config, meta_info, _id):
-        return self.run_id
+# region Collecting phase
+class Experiment(AutoMunch):
+    @property
+    def session(self):
+        return self.sessions[-1]
 
 
-# noinspection PyUnusedLocal
-@ex.config
-def config_autos():
-    opts = dict(
-        cpus=multiprocessing.cpu_count() - 1,
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        save_every='_never_',
-        log_every='_never_'
-    )
-    opts = dict(
-        session=f'{socket.gethostname()}_{arrow.utcnow()}'
-    )
+experiment = Experiment()
 
+# Experiment defaults
+experiment.name = 'experiment'
+experiment.tags = []
+experiment.samples = 0
+experiment.model = {'fn': None, 'args': [], 'kwargs': {}}
+experiment.optimizer = {'fn': None, 'args': [], 'kwargs': {}}
+experiment.sessions = []
 
-@ex.config_hook
-def cfg_hook(config, command_name, logger):
-    updates = {}
-    paths = config['paths']
-    if 'root' in paths:
-        updates['root'] = Path(paths['root']).expanduser().resolve()
-    if 'data' in paths:
-        updates['data'] = Path(paths['data']).expanduser().resolve()
+# Session defaults
+session = AutoMunch()
+session.l1 = 0
+session.seed = random.randint(0, 99)
+session.cpus = multiprocessing.cpu_count() - 1
+session.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+session.log = {'when': []}
+session.checkpoint = {'when': []}
+
+# Experiment configuration
+for string in args.experiment:
+    if '=' in string:
+        update = parse_dotted(string)
     else:
-        updates['data'] = Path(paths['root']).joinpath('data').expanduser().resolve()
-    if 'runs' in paths:
-        updates['runs'] = Path(paths['runs']).expanduser().resolve()
-    else:
-        updates['runs'] = Path(paths['root']).joinpath('runs').expanduser().resolve()
+        with open(string, 'r') as f:
+            update = yaml.safe_load(f)
+    # If the current session is defined inside the experiment update the session instead
+    if 'session' in update:
+        update_rec(session, update.pop('session'))
+    update_rec(experiment, update)
 
-    ex.observers.append(RunIdHack(config['opts']['session']))
-    if command_name != 'print_config' and config['opts']['log_every'] != '_never_':
-        ex.observers.append(FileStorageObserver.create(updates['runs']))
-    return dict(paths={n: p.as_posix() for n, p in updates.items()})
+# Model from --model args
+for string in args.model:
+    if '=' in string:
+        update = parse_dotted(string)
+    else:
+        with open(string, 'r') as f:
+            update = yaml.safe_load(f)
+            # If the yaml file contains a single entry with key `model` use that one instead
+            if update.keys() == {'model'}:
+                update = update['model']
+    update_rec(experiment.model, update)
+
+# Optimizer from --optimizer args
+for string in args.optimizer:
+    if '=' in string:
+        update = parse_dotted(string)
+    else:
+        with open(string, 'r') as f:
+            update = yaml.safe_load(f)
+            # If the yaml file contains a single entry with key `optimizer` use that one instead
+            if update.keys() == {'optimizer'}:
+                update = update['optimizer']
+    update_rec(experiment.optimizer, update)
+
+# Session from --session args
+for string in args.session:
+    if '=' in string:
+        update = parse_dotted(string)
+    else:
+        with open(string, 'r') as f:
+            update = yaml.safe_load(f)
+            # If the yaml file contains a single entry with key `session` use that one instead
+            if update.keys() == {'session'}:
+                update = update['session']
+    update_rec(session, update)
+
+# Checks (some missing, others redundant)
+if experiment.name is None or len(experiment.name) == 0:
+    raise ValueError(f'Experiment name is empty: {experiment.name}')
+if experiment.tags is None:
+    raise ValueError('Experiment tags is None')
+if experiment.model.fn is None:
+    raise ValueError('Model constructor function not defined')
+if experiment.optimizer.fn is None:
+    raise ValueError('Optimizer constructor function not defined')
+if session.cpus < 0:
+    raise ValueError(f'Invalid number of cpus: {session.cpus}')
+if session.l1 < 0:
+    raise ValueError(f'Invalid factor for L1: {session.l1}')
+if len(experiment.sessions) > 0 and ('state_dict' not in experiment.model or 'state_dict' not in experiment.optimizer):
+    raise ValueError(f'Model and optimizer state dicts are required to restore training')
+
+# Experiment computed fields
+experiment.epoch = sum((s.epochs for s in experiment.sessions), 0)
+
+# Session computed fields
+session.status = 'NEW'
+session.datetime_started = None
+session.datetime_completed = None
+git = git_info()
+if git is not None:
+    session.git = git
+if 'cuda' in session.device:
+    session.cuda = cuda_info()
+
+# Resolving paths
+rand_id = ''.join(chr(random.randint(ord('A'), ord('Z'))) for _ in range(6))
+session.data.folder = Path(session.data.folder.replace('{name}', experiment.name)).expanduser().resolve().as_posix()
+session.log.folder = session.log.folder \
+    .replace('{name}', experiment.name) \
+    .replace('{tags}', '_'.join(experiment.tags)) \
+    .replace('{rand}', rand_id)
+if len(session.checkpoint.when) > 0:
+    if len(session.log.when) > 0:
+        session.log.folder = Path(session.log.folder).expanduser().resolve().as_posix()
+    session.checkpoint.folder = session.checkpoint.folder \
+        .replace('{name}', experiment.name) \
+        .replace('{tags}', '_'.join(experiment.tags)) \
+        .replace('{rand}', rand_id)
+    session.checkpoint.folder = Path(session.checkpoint.folder).expanduser().resolve().as_posix()
+if 'state_dict' in experiment.model:
+    experiment.model.state_dict = Path(experiment.model.state_dict).expanduser().resolve().as_posix()
+if 'state_dict' in experiment.optimizer:
+    experiment.optimizer.state_dict = Path(experiment.optimizer.state_dict).expanduser().resolve().as_posix()
+
+sort_dict(experiment, ['name', 'tags', 'epoch', 'samples', 'model', 'optimizer', 'sessions'])
+sort_dict(session, ['epochs', 'batch_size', 'l1', 'seed', 'cpus', 'device', 'samples', 'status',
+                    'datetime_started', 'datetime_completed', 'data', 'log', 'checkpoint', 'git', 'gpus'])
+experiment.sessions.append(session)
+pyaml.pprint(experiment, sort_dicts=False, width=200)
 # endregion
 
+# region Building phase
+# Seeds (set them after the random run id is generated)
+set_seeds(experiment.session.seed)
 
-# region Setup and helper functions
-def set_seeds(_seed):
-    random.seed(_seed)
-    np.random.seed(_seed)
-    torch.random.manual_seed(_seed)
+# Model
+model: torch.nn.Module = import_(experiment.model.fn)(*experiment.model.args, **experiment.model.kwargs)
+if 'state_dict' in experiment.model:
+    model.load_state_dict(torch.load(experiment.model.state_dict))
+model.to(session.device)
 
+# Optimizer
+optimizer: torch.optim.Optimizer = import_(experiment.optimizer.fn)(
+    model.parameters(), *experiment.optimizer.args, **experiment.optimizer.kwargs)
+if 'state_dict' in experiment.optimizer:
+    optimizer.load_state_dict(torch.load(experiment.optimizer.state_dict))
 
-def load_model_opt(model, optimizer, opts):
-    model_class = load_class(model['klass'])
-    model = model_class(**model['params']).to(opts['device'])
-    opt_class = load_class(optimizer['klass'])
-    optimizer = opt_class(params=model.parameters(), **optimizer['params'])
-    return model, optimizer
+# Logger
+if len(experiment.session.log.when) > 0:
+    logger = SummaryWriter(experiment.session.log.folder)
+    logger.add_text(
+        'experiment', textwrap.indent(pyaml.dump(experiment, safe=True, sort_dicts=False), '    '), experiment.samples)
+else:
+    logger = None
 
-
-def prepare_saver(opts, paths):
-    if opts['save_every'] != '_never_':
-        saver = Saver(paths['runs'])
-        should_save = lambda epoch_idx: epoch_idx % opts['save_every'] == 0
-    else:
-        saver = None
-        should_save = lambda _: False
-    return saver, should_save
-
-
-def prepare_logger(training, opts, paths, _run):
-    if opts['log_every'] != '_never_':
-        from tensorboardX import SummaryWriter
-        logger = SummaryWriter(Path(paths['runs']).joinpath(opts['session']).as_posix())
-        mod = training['batch_size'] if opts['log_every'] == '_batch_' else int(opts['log_every'])
-        should_log = lambda samples: samples % mod == 0
-    else:
-        logger = None
-        should_log = lambda _: False
-    return logger, should_log
-
-
-def get_dataloader(name, paths, training, opts, shuffle):
-    path = Path(paths['data']).joinpath(name).with_suffix('.pt')
-    dataset = torch.load(path)
-    if not isinstance(dataset, InfectionDataset):
-        raise ValueError(f'Not an InfectionDataset: {path}')
-    return torch.utils.data.DataLoader(
-        dataset,
-        batch_size=training['batch_size'],
-        collate_fn=tg.GraphBatch.collate,
-        num_workers=opts['cpus'],
-        shuffle=shuffle,
-        pin_memory='cuda' in str(opts['device']),
-        worker_init_fn=lambda _: np.random.seed(int(torch.initial_seed()) % (2 ** 32 - 1))
-    )
+# Saver
+if len(experiment.session.checkpoint.when) > 0:
+    saver = Saver(experiment.session.checkpoint.folder)
+    if experiment.epoch == 0:
+        saver.save_experiment(experiment, suffix=f'e{experiment.epoch:04d}')
+else:
+    saver = None
 # endregion
 
+# region Training
+# Datasets and dataloaders
+dataloader_kwargs = dict(
+    num_workers=min(experiment.session.cpus, 1) if 'cuda' in experiment.session.device else experiment.session.cpus,
+    pin_memory='cuda' in experiment.session.device,
+    worker_init_fn=lambda _: np.random.seed(int(torch.initial_seed()) % (2 ** 32 - 1)),
+    batch_size=experiment.session.batch_size,
+    collate_fn=tg.GraphBatch.collate,
+)
+dataset_train: InfectionDataset = torch.load(Path(experiment.session.data.folder) / 'train.pt')
+dataloader_train = torch.utils.data.DataLoader(
+    dataset_train,
+    shuffle=True,
+    **dataloader_kwargs
+)
+dataset_val: InfectionDataset = torch.load(Path(experiment.session.data.folder) / 'val.pt')
+dataloader_val = torch.utils.data.DataLoader(
+    dataset_val,
+    shuffle=False,
+    **dataloader_kwargs
+)
 
-@ex.automain
-def train(model, optimizer, training, opts, paths, _run, _seed):
-    set_seeds(_seed)
-    opts['device'] = torch.device(opts['device'])
-    paths = {n: Path(p) for n, p in paths.items()}
-    model, optimizer = load_model_opt(model, optimizer, opts)
-    saver, should_save = prepare_saver(opts, paths)
-    logger, should_log = prepare_logger(training, opts, paths, _run)
+# Train and validation loops
+experiment.session.status = 'RUNNING'
+experiment.session.datetime_started = datetime.utcnow()
 
-    _run.info['epochs'] = 0
-    _run.info['samples'] = 0
+epoch_bar_postfix = {}
+epoch_bar = tqdm.trange(1, experiment.session.epochs + 1, desc='Epochs', unit='e', leave=True)
+for epoch_idx in epoch_bar:
+    experiment.epoch += 1
 
-    dataloader_train = get_dataloader('train', paths, training, opts, shuffle=True)
-    dataloader_val = get_dataloader('val', paths, training, opts, shuffle=False)
+    # region Training loop
+    model.train()
+    train_bar_postfix={}
+    loss_bce_avg = RunningWeightedAverage()
+    with tqdm.tqdm(desc=f'Train {experiment.epoch}', total=len(dataloader_train.dataset), unit='g') as bar:
+        for graphs, targets in dataloader_train:
+            graphs = graphs.to(experiment.session.device)
+            targets = targets.node_features.squeeze().to(experiment.session.device)
 
-    epoch_bar_postfix = {}
-    epoch_start = _run.info['epochs'] + 1
-    epoch_end = _run.info['epochs'] + 1 + training['epochs']
-    epoch_bar = tqdm.trange(epoch_start, epoch_end, desc='Training', unit='e', leave=True)
-    for epoch in epoch_bar:
-        # region Training loop
-        model.train()
-        losses_batch = 0
-        with tqdm.tqdm(desc=f'Train {epoch}', total=len(dataloader_train.dataset), unit='g') as bar:
-            for graphs, targets in dataloader_train:
-                graphs = graphs.to(opts['device'])
-                targets = targets.node_features.squeeze().to(opts['device'])
+            results = model(graphs).node_features.squeeze()
+            loss_bce = F.binary_cross_entropy_with_logits(results, targets.float(), reduction='mean')
+            loss_total = loss_bce
+            if experiment.session.l1 > 0:
+                loss_l1 = experiment.session.l1 * sum([p.abs().sum() for p in model.parameters()])
+                loss_total += loss_l1
+                train_bar_postfix['L1'] = f'{loss_l1.item():.5f}'
+                if 'every batch' in experiment.session.log.when:
+                    logger.add_scalar('loss/train/l1', loss_l1.item(), global_step=experiment.samples)
 
-                results = model(graphs).node_features.squeeze()
-                loss = F.binary_cross_entropy_with_logits(results, targets.float(), reduction='mean')
+            optimizer.zero_grad()
+            loss_total.backward()
+            optimizer.step(closure=None)
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step(closure=None)
+            experiment.samples += len(graphs)
+            loss_bce_avg.add(loss_bce.item(), len(graphs))
 
-                _run.info['samples'] += graphs.num_graphs
-                losses_batch += loss.item() * graphs.num_graphs
+            bar.update(len(graphs))
+            train_bar_postfix['BCE'] = f'{loss_bce.item():.5f}'
+            bar.set_postfix(train_bar_postfix)
+            if 'every batch' in experiment.session.log.when:
+                logger.add_scalar('loss/train/bce', loss_bce.item(), global_step=experiment.samples)
+                logger.add_scalar('loss/train/total', loss_total.item(), global_step=experiment.samples)
+    epoch_bar_postfix['Train'] = f'{loss_bce_avg.get():.4f}'
+    epoch_bar.set_postfix(epoch_bar_postfix)
+    # endregion
 
-                bar.update(graphs.num_graphs)
-                bar.set_postfix_str(f'Loss: {loss.item():.9f}')
-                if should_log(_run.info['samples']):
-                    logger.add_scalar('loss/train', loss.item(), global_step=_run.info['samples'])
-                    _run.log_scalar('loss/train', loss.item(), step=_run.info['samples'])
-        epoch_bar_postfix['Train'] = f'{losses_batch / len(dataloader_train.dataset):.4f}'
-        epoch_bar.set_postfix(epoch_bar_postfix)
-        # endregion
-
-        # Saving
-        _run.info['epochs'] += 1
-        if should_save(_run.info['epochs']):
-            saver.save(id_=epoch, model=model, optimizer=optimizer, **_run.info)
-
-        # region Validation loop
-        model.eval()
-        losses_batch = 0
-        with torch.no_grad():
-            with tqdm.tqdm(desc=f'Val {epoch}', total=len(dataloader_val.dataset), unit='g') as bar:
-                for graphs, targets in dataloader_val:
-                    graphs = graphs.to(opts['device'])
-                    targets = targets.node_features.squeeze().to(opts['device'])
-
-                    results = model(graphs).node_features.squeeze()
-                    loss = F.binary_cross_entropy_with_logits(results, targets.float(), reduction='mean')
-
-                    losses_batch += loss.item() * graphs.num_graphs
-                    bar.update(graphs.num_graphs)
-                    bar.set_postfix_str(f'Loss: {loss.item():.9f}')
-        if should_log(_run.info['samples']):
-            logger.add_scalar('loss/val', losses_batch / len(dataloader_val.dataset), global_step=_run.info['samples'])
-            _run.log_scalar('loss/val', losses_batch / len(dataloader_val.dataset), step=_run.info['samples'])
-        epoch_bar_postfix['Val'] = f'{losses_batch / len(dataloader_val.dataset):.4f}'
-        epoch_bar.set_postfix(epoch_bar_postfix)
-        # endregion
-    epoch_bar.close()
-
-    dataset_train_max_nodes = dataloader_train.dataset.max_nodes
-    dataset_train_min_nodes = dataloader_train.dataset.min_nodes
-    del dataloader_train, dataloader_val, optimizer
-
-    # region Testing
+    # region Validation loop
     model.eval()
-    dataloader_test = get_dataloader('test', paths, training, opts, shuffle=False)
+    loss_avg = RunningWeightedAverage()
     stats_df = {k: [] for k in ['Loss', 'Nodes', 'Edges', 'Predict', 'Target', 'AvgPrecision', 'AreaROC']}
     huge_dict = {'targets': [], 'results': []}
     with torch.no_grad():
-        with tqdm.tqdm(desc='Test', total=len(dataloader_test.dataset), leave=True, unit='g') as bar:
-            for graphs, targets in dataloader_test:
-                graphs = graphs.to(opts['device'])
-                targets = targets.to(opts['device'])
+        with tqdm.tqdm(desc=f'Val {experiment.epoch}', total=len(dataloader_val.dataset), unit='g') as bar:
+            for graphs, targets in dataloader_val:
+                graphs = graphs.to(experiment.session.device)
+                targets = targets.to(experiment.session.device)
 
                 results = model(graphs)
                 losses = F.binary_cross_entropy_with_logits(
                     results.node_features.squeeze(), targets.node_features.squeeze().float(), reduction='none')
+                loss_avg.add(losses.mean().item(), len(graphs))
 
                 idx = tg.utils.segment_lengths_to_ids(graphs.num_nodes_by_graph)
                 losses_by_graph = torch_scatter.scatter_mean(
@@ -261,98 +316,114 @@ def train(model, optimizer, training, opts, paths, _run, _seed):
 
                 bar.update(graphs.num_graphs)
                 bar.set_postfix_str(f'Loss: {losses.mean().item():.9f}')
-    dataset_test_max_nodes = dataloader_test.dataset.max_nodes
-    del dataloader_test
+
+    logger.add_scalar('loss/val/bce', loss_avg.get(), global_step=experiment.samples)
+    epoch_bar_postfix['Val'] = f'{loss_avg.get():.4f}'
+    epoch_bar.set_postfix(epoch_bar_postfix)
     # endregion
 
-    # region Final report
-    targets = torch.cat(huge_dict['targets']).int()  # numpy does not work with torch.int8
-    results = torch.cat(huge_dict['results'])
-    del huge_dict
-    _run.info['average_precision'] = sklearn.metrics.average_precision_score(y_true=targets, y_score=results)
-    print('Average precision:', _run.info['average_precision'])
-    if False:
-        import matplotlib.pyplot as plt
-        precision, recall, _ = sklearn.metrics.precision_recall_curve(y_true=targets, probas_pred=results)
-        plt.step(recall, precision, color='b', alpha=0.2, where='post')
-        plt.fill_between(recall, precision, alpha=0.2, color='b', step='post')
-        plt.xlabel('Recall')
-        plt.ylabel('Precision')
-        plt.ylim([0.0, 1.05])
-        plt.xlim([0.0, 1.0])
-        plt.title(f'Precision-Recall curve: AP={_run.info["average_precision"]:.2f}')
-        plt.show()
-    if logger is not None:
-        logger.add_scalar('test/avg_precision', _run.info['average_precision'], global_step=_run.info['samples'])
-        logger.add_pr_curve('test/pr_curve', labels=targets, predictions=results, global_step=_run.info['samples'])
-    del targets, results
+    # Saving
+    if epoch_idx == experiment.session.epochs:
+        experiment.session.status = 'DONE'
+        experiment.session.datetime_completed = datetime.utcnow()
+    if (
+            'every epoch' in experiment.session.checkpoint.when or
+            'last epoch' in experiment.session.checkpoint.when and epoch_idx == experiment.session.epochs
+    ):
+        saver.save(model, experiment, optimizer, suffix=f'e{experiment.epoch:04d}')
+epoch_bar.close()
+# endregion
 
-    stats_df = pd.DataFrame({k: np.concatenate(v) for k, v in stats_df.items()}).rename_axis('GraphId').reset_index()
+# region Final report
+targets = torch.cat(huge_dict['targets']).int()  # numpy does not work with torch.int8
+results = torch.cat(huge_dict['results'])
+del huge_dict
 
-    # Split the results based on whether the number of nodes was present in the training set or not
-    df_train_test = stats_df \
-        .groupby(np.where(stats_df.Nodes < dataset_train_max_nodes,
-                          f'Train [{dataset_train_min_nodes}, {dataset_train_max_nodes - 1})',
-                          f'Test  [{dataset_train_max_nodes}, {dataset_test_max_nodes - 1})')) \
-        .agg({'Nodes': ['min', 'max'], 'GraphId': 'count', 'Loss': 'mean'}) \
-        .sort_index(ascending=False) \
-        .rename_axis(index='Dataset') \
-        .rename(str.capitalize, axis='columns', level=1)
+experiment.average_precision = sklearn.metrics.average_precision_score(y_true=targets, y_score=results)
+print('Average precision:', experiment.average_precision)
+if False:
+    import matplotlib.pyplot as plt
+    precision, recall, _ = sklearn.metrics.precision_recall_curve(y_true=targets, probas_pred=results)
+    plt.step(recall, precision, color='b', alpha=0.2, where='post')
+    plt.fill_between(recall, precision, alpha=0.2, color='b', step='post')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.ylim([0.0, 1.05])
+    plt.xlim([0.0, 1.0])
+    plt.title(f'Precision-Recall curve: AP={experiment.average_precision:.2f}')
+    plt.show()
+if logger is not None:
+    logger.add_scalar('val/avg_precision', experiment.average_precision, global_step=experiment.samples)
+    logger.add_pr_curve('val/pr_curve', labels=targets, predictions=results, global_step=experiment.samples)
+del targets, results
 
-    # Split the results in ranges based on the number of nodes and compute the average loss per range
-    df_losses_by_node_range = stats_df \
-        .groupby(stats_df.Nodes // 10) \
-        .agg({'Nodes': ['min', 'max'], 'GraphId': 'count', 'Loss': 'mean'}) \
-        .rename_axis(index='NodeRange') \
-        .rename(lambda node_group_min: f'[{node_group_min * 10}, {node_group_min * 10 + 10})', axis='index') \
-        .rename(str.capitalize, axis='columns', level=1)
+stats_df = pd.DataFrame({k: np.concatenate(v) for k, v in stats_df.items()}).rename_axis('GraphId').reset_index()
 
-    # Split the results in ranges based on the number of nodes and keep the N worst predictions
-    df_worst_graphs_by_node_range = stats_df \
-        .groupby(stats_df.Nodes // 10) \
-        .apply(lambda df_gr: df_gr.nlargest(5, 'Loss').set_index('GraphId')) \
-        .rename_axis(index={'Nodes': 'NodeRange'}) \
-        .rename(lambda node_group_min: f'[{node_group_min * 10}, {node_group_min * 10 + 10})', axis='index', level=0)
+# Split the results based on whether the number of nodes was present in the training set or not
+df_train_val = stats_df \
+    .groupby(np.where(stats_df.Nodes < dataset_train.max_nodes,
+                      f'Train [{dataset_train.min_nodes}, {dataset_train.max_nodes - 1})',
+                      f'Val  [{dataset_train.max_nodes}, {dataset_val.max_nodes - 1})')) \
+    .agg({'Nodes': ['min', 'max'], 'GraphId': 'count', 'Loss': 'mean'}) \
+    .sort_index(ascending=False) \
+    .rename_axis(index='Dataset') \
+    .rename(str.capitalize, axis='columns', level=1)
 
-    # Split the results in ranges based on the number of nodes and keep the N best predictions
-    df_best_graphs_by_node_range = stats_df \
-        .groupby(stats_df.Nodes // 10) \
-        .apply(lambda df_gr: df_gr.nsmallest(3, 'Loss').set_index('GraphId')) \
-        .rename_axis(index={'Nodes': 'NodeRange'}) \
-        .rename(lambda node_group_min: f'[{node_group_min * 10}, {node_group_min * 10 + 10})', axis='index', level=0)
+# Split the results in ranges based on the number of nodes and compute the average loss per range
+df_losses_by_node_range = stats_df \
+    .groupby(stats_df.Nodes // 10) \
+    .agg({'Nodes': ['min', 'max'], 'GraphId': 'count', 'Loss': 'mean'}) \
+    .rename_axis(index='NodeRange') \
+    .rename(lambda node_group_min: f'[{node_group_min * 10}, {node_group_min * 10 + 10})', axis='index') \
+    .rename(str.capitalize, axis='columns', level=1)
 
-    print('',
-          df_train_test.to_string(float_format=lambda x: f'{x:.2f}'),
-          df_losses_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'),
-          df_best_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'),
-          df_worst_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'),
-          sep='\n\n')
+# Split the results in ranges based on the number of nodes and keep the N worst predictions
+df_worst_graphs_by_node_range = stats_df \
+    .groupby(stats_df.Nodes // 10) \
+    .apply(lambda df_gr: df_gr.nlargest(5, 'Loss').set_index('GraphId')) \
+    .rename_axis(index={'Nodes': 'NodeRange'}) \
+    .rename(lambda node_group_min: f'[{node_group_min * 10}, {node_group_min * 10 + 10})', axis='index', level=0)
 
-    if logger is not None:
-        logger.add_text(
-            'Generalization',
-            textwrap.indent(df_train_test.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
-            global_step=ex.info['samples'])
-        logger.add_text(
-            'Loss by range',
-            textwrap.indent(df_losses_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
-            global_step=ex.info['samples'])
-        logger.add_text(
-            'Best predictions',
-            textwrap.indent(df_best_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
-            global_step=ex.info['samples'])
-        logger.add_text(
-            'Worst predictions',
-            textwrap.indent(df_worst_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
-            global_step=ex.info['samples'])
+# Split the results in ranges based on the number of nodes and keep the N best predictions
+df_best_graphs_by_node_range = stats_df \
+    .groupby(stats_df.Nodes // 10) \
+    .apply(lambda df_gr: df_gr.nsmallest(3, 'Loss').set_index('GraphId')) \
+    .rename_axis(index={'Nodes': 'NodeRange'}) \
+    .rename(lambda node_group_min: f'[{node_group_min * 10}, {node_group_min * 10 + 10})', axis='index', level=0)
 
-    params = [f'{name}:\n{param.data.cpu().numpy().round(3)}' for name, param in model.named_parameters()]
-    print('Parameters:', *params, sep='\n\n')
-    if logger is not None:
-        logger.add_text('Parameters', textwrap.indent('\n\n'.join(params), '    '), global_step=ex.info['samples'])
-    # endregion
+print('',
+      df_train_val.to_string(float_format=lambda x: f'{x:.2f}'),
+      df_losses_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'),
+      df_best_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'),
+      df_worst_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'),
+      sep='\n\n')
 
-    if logger is not None:
-        logger.close()
+if logger is not None:
+    logger.add_text(
+        'Generalization',
+        textwrap.indent(df_train_val.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
+        global_step=experiment.samples)
+    logger.add_text(
+        'Loss by range',
+        textwrap.indent(df_losses_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
+        global_step=experiment.samples)
+    logger.add_text(
+        'Best predictions',
+        textwrap.indent(df_best_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
+        global_step=experiment.samples)
+    logger.add_text(
+        'Worst predictions',
+        textwrap.indent(df_worst_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
+        global_step=experiment.samples)
 
-    return _run.info['average_precision']
+params = [f'{name}:\n{param.data.cpu().numpy().round(3)}' for name, param in model.named_parameters()]
+print('Parameters:', *params, sep='\n\n')
+if logger is not None:
+    logger.add_text('Parameters', textwrap.indent('\n\n'.join(params), '    '), global_step=experiment.samples)
+# endregion
+
+# region Cleanup
+if logger is not None:
+    logger.close()
+exit()
+# endregion
