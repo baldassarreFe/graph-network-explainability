@@ -17,6 +17,5 @@ session:
   checkpoint:
     folder: ~/experiments/{name}/runs/{tags}_{rand}
     when:
-      - every epoch
+      #- every epoch
       - last epoch
-      - improvement
