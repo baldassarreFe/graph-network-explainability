@@ -109,8 +109,15 @@ class RunningWeightedAverage(object):
         self.total_weighted_value = 0
 
     def add(self, value, weight):
+        if weight <= 0:
+            raise ValueError()
         self.total_weighted_value += value * weight
         self.total_weight += weight
 
     def get(self):
+        if self.total_weight == 0:
+            return 0
         return self.total_weighted_value / self.total_weight
+
+    def __repr__(self):
+        return f'{self.get() (self.total_weight)}'

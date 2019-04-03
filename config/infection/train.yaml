@@ -8,6 +8,10 @@ optimizer:
 session:
   epochs: 20
   batch_size: 1_000
+  losses:
+    nodes: 1
+    count: 1
+    l1: 0
   data:
     folder: ~/experiments/{name}/data
   log:

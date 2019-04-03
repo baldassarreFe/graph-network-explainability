@@ -63,17 +63,23 @@ For this task, the minimal version of the network should only use:
        
     conda activate tg-experiments
     for i in $(seq  0 2); do
-       for type in subminimal minimal full; do
-           for lr in .01 .001; do
-               for wd in 0 .001; do
-                    python -m infection.train \
-                       --experiment ../config/infection/train.yaml "tags=[${type},lr${lr}.wd${wd}]" \
+      for type in subminimal minimal full; do
+        for lr in .01 .001; do
+          for l1 in 0 .0001; do
+            for infection in 1 10; do
+              for count in .01 .001; do
+                python -m infection.train \
+                       --experiment \
+                         ../config/infection/train.yaml \
+                         "tags=[${type},lr${lr},nodes${infection},count${count},l1${l1}]" \
                        --model "../config/infection/${type}.yaml" \
                        --optimizer "kwargs.lr=${lr}" \
-                       --session "l1=${wd}"
-               done
-           done
-       done
+                       --session "losses.l1=${l1}" "losses.nodes=${infection}" "losses.count=${count}"
+              done
+            done
+          done
+        done
+      done
     done
     ```
 6. Query logs and visualize

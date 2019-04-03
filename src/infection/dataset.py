@@ -48,7 +48,7 @@ class InfectionDataset(torch.utils.data.Dataset):
         target = torch.zeros((num_nodes, 1), dtype=torch.int8)
         target[sick] = 1
         target[list({n for s in sick for n in g_nx.neighbors(s) if n not in immune})] = 1
-        target = tg.Graph(node_features=target)
+        target = tg.Graph(node_features=target, global_features=target.sum(dim=0))
 
         return g, target
 

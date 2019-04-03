@@ -52,7 +52,7 @@ experiment.sessions = []
 
 # Session defaults
 session = AutoMunch()
-session.l1 = 0
+session.losses = {'nodes': 0, 'count': 0, 'l1': 0}
 session.seed = random.randint(0, 99)
 session.cpus = multiprocessing.cpu_count() - 1
 session.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -82,6 +82,7 @@ for string in args.model:
             if update.keys() == {'model'}:
                 update = update['model']
     update_rec(experiment.model, update)
+    del update
 
 # Optimizer from --optimizer args
 for string in args.optimizer:
@@ -94,6 +95,7 @@ for string in args.optimizer:
             if update.keys() == {'optimizer'}:
                 update = update['optimizer']
     update_rec(experiment.optimizer, update)
+    del update
 
 # Session from --session args
 for string in args.session:
@@ -106,6 +108,7 @@ for string in args.session:
             if update.keys() == {'session'}:
                 update = update['session']
     update_rec(session, update)
+    del update
 
 # Checks (some missing, others redundant)
 if experiment.name is None or len(experiment.name) == 0:
@@ -118,8 +121,8 @@ if experiment.optimizer.fn is None:
     raise ValueError('Optimizer constructor function not defined')
 if session.cpus < 0:
     raise ValueError(f'Invalid number of cpus: {session.cpus}')
-if session.l1 < 0:
-    raise ValueError(f'Invalid factor for L1: {session.l1}')
+if any(l < 0 for l in session.losses.values()) or all(l == 0 for l in session.losses.values()):
+    raise ValueError(f'Invalid losses: {session.losses}')
 if len(experiment.sessions) > 0 and ('state_dict' not in experiment.model or 'state_dict' not in experiment.optimizer):
     raise ValueError(f'Model and optimizer state dicts are required to restore training')
 
@@ -157,10 +160,11 @@ if 'state_dict' in experiment.optimizer:
     experiment.optimizer.state_dict = Path(experiment.optimizer.state_dict).expanduser().resolve().as_posix()
 
 sort_dict(experiment, ['name', 'tags', 'epoch', 'samples', 'model', 'optimizer', 'sessions'])
-sort_dict(session, ['epochs', 'batch_size', 'l1', 'seed', 'cpus', 'device', 'samples', 'status',
+sort_dict(session, ['epochs', 'batch_size', 'losses', 'seed', 'cpus', 'device', 'samples', 'status',
                     'datetime_started', 'datetime_completed', 'data', 'log', 'checkpoint', 'git', 'gpus'])
 experiment.sessions.append(session)
 pyaml.pprint(experiment, sort_dicts=False, width=200)
+del session
 # endregion
 
 # region Building phase
@@ -171,7 +175,7 @@ set_seeds(experiment.session.seed)
 model: torch.nn.Module = import_(experiment.model.fn)(*experiment.model.args, **experiment.model.kwargs)
 if 'state_dict' in experiment.model:
     model.load_state_dict(torch.load(experiment.model.state_dict))
-model.to(session.device)
+model.to(experiment.session.device)
 
 # Optimizer
 optimizer: torch.optim.Optimizer = import_(experiment.optimizer.fn)(
@@ -183,7 +187,7 @@ if 'state_dict' in experiment.optimizer:
 if len(experiment.session.log.when) > 0:
     logger = SummaryWriter(experiment.session.log.folder)
     logger.add_text(
-        'experiment', textwrap.indent(pyaml.dump(experiment, safe=True, sort_dicts=False), '    '), experiment.samples)
+        'Experiment', textwrap.indent(pyaml.dump(experiment, safe=True, sort_dicts=False), '    '), experiment.samples)
 else:
     logger = None
 
@@ -216,11 +220,16 @@ dataloader_val = torch.utils.data.DataLoader(
     shuffle=False,
     **dataloader_kwargs
 )
+del dataloader_kwargs
 
 # region Training
 # Train and validation loops
 experiment.session.status = 'RUNNING'
 experiment.session.datetime_started = datetime.utcnow()
+
+stats_df = {k: [] for k in ['LossInfection', 'LossCount', 'Nodes', 'Edges', 'InfectedSum',
+                            'InfectedCount', 'InfectedStartTrue', 'InfectedEndTrue', 'AvgPrecision', 'AreaROC']}
+huge_dict = {'targets': [], 'results': []}
 
 epoch_bar_postfix = {}
 epoch_bar = tqdm.trange(1, experiment.session.epochs + 1, desc='Epochs', unit='e', leave=True)
@@ -229,97 +238,191 @@ for epoch_idx in epoch_bar:
 
     # region Training loop
     model.train()
-    train_bar_postfix={}
+    torch.set_grad_enabled(True)
+    
+    train_bar_postfix = {}
     loss_bce_avg = RunningWeightedAverage()
-    with tqdm.tqdm(desc=f'Train {experiment.epoch}', total=len(dataloader_train.dataset), unit='g') as bar:
-        for graphs, targets in dataloader_train:
-            graphs = graphs.to(experiment.session.device)
-            targets = targets.node_features.squeeze().to(experiment.session.device)
+    loss_count_avg = RunningWeightedAverage()
+    loss_l1_avg = RunningWeightedAverage()
+    loss_total_avg = RunningWeightedAverage()
 
-            results = model(graphs).node_features.squeeze()
-            loss_bce = F.binary_cross_entropy_with_logits(results, targets.float(), reduction='mean')
-            loss_total = loss_bce
-            if experiment.session.l1 > 0:
-                loss_l1 = experiment.session.l1 * sum([p.abs().sum() for p in model.parameters()])
-                loss_total += loss_l1
-                train_bar_postfix['L1'] = f'{loss_l1.item():.5f}'
-                if 'every batch' in experiment.session.log.when:
-                    logger.add_scalar('loss/train/l1', loss_l1.item(), global_step=experiment.samples)
+    train_bar = tqdm.tqdm(desc=f'Train {experiment.epoch}', total=len(dataloader_train.dataset), unit='g') 
+    for graphs, targets in dataloader_train:
+        graphs = graphs.to(experiment.session.device)
+        targets = targets.to(experiment.session.device)
+        results = model(graphs)
 
-            optimizer.zero_grad()
-            loss_total.backward()
-            optimizer.step(closure=None)
+        loss_total = torch.tensor(0., device=experiment.session.device)
 
-            experiment.samples += len(graphs)
+        if experiment.session.losses.nodes > 0:
+            loss_bce = F.binary_cross_entropy_with_logits(
+                results.node_features.squeeze(), targets.node_features.squeeze().float(), reduction='mean')
+            loss_total += experiment.session.losses.nodes * loss_bce
             loss_bce_avg.add(loss_bce.item(), len(graphs))
-
-            bar.update(len(graphs))
-            train_bar_postfix['BCE'] = f'{loss_bce.item():.5f}'
-            bar.set_postfix(train_bar_postfix)
+            train_bar_postfix['Infected'] = f'{loss_bce.item():.5f}'
             if 'every batch' in experiment.session.log.when:
-                logger.add_scalar('loss/train/bce', loss_bce.item(), global_step=experiment.samples)
-                logger.add_scalar('loss/train/total', loss_total.item(), global_step=experiment.samples)
-    epoch_bar_postfix['Train'] = f'{loss_bce_avg.get():.4f}'
+                logger.add_scalar('loss/train/infected', loss_bce.item(), global_step=experiment.samples)
+
+        if experiment.session.losses.count > 0:
+            loss_count = F.mse_loss(
+                results.global_features.squeeze(), targets.global_features.squeeze().float(), reduction='mean')
+            loss_total += experiment.session.losses.count * loss_count
+            loss_count_avg.add(loss_count.item(), len(graphs))
+            train_bar_postfix['Count'] = f'{loss_count.item():.5f}'
+            if 'every batch' in experiment.session.log.when:
+                logger.add_scalar('loss/train/count', loss_count.item(), global_step=experiment.samples)
+
+        if experiment.session.losses.l1 > 0:
+            loss_l1 = sum([p.abs().sum() for p in model.parameters()])
+            loss_total += experiment.session.losses.l1 * loss_l1
+            loss_l1_avg.add(loss_l1.item(), len(graphs))
+            train_bar_postfix['L1'] = f'{loss_l1.item():.5f}'
+            if 'every batch' in experiment.session.log.when:
+                logger.add_scalar('loss/train/l1', loss_l1.item(), global_step=experiment.samples)
+
+        loss_total_avg.add(loss_total.item(), len(graphs))
+        train_bar_postfix['Total'] = f'{loss_total.item():.5f}'
+        if 'every batch' in experiment.session.log.when:
+            logger.add_scalar('loss/train/total', loss_total.item(), global_step=experiment.samples)
+
+        optimizer.zero_grad()
+        loss_total.backward()
+        optimizer.step(closure=None)
+
+        experiment.samples += len(graphs)
+        train_bar.update(len(graphs))
+        train_bar.set_postfix(train_bar_postfix)
+    train_bar.close()
+
+    epoch_bar_postfix['Train'] = f'{loss_total_avg.get():.4f}'
     epoch_bar.set_postfix(epoch_bar_postfix)
+
+    if 'every epoch' in experiment.session.log.when and 'every batch' not in experiment.session.log.when:
+        logger.add_scalar('loss/train/total', loss_total_avg.get(), global_step=experiment.samples)
+        if experiment.session.losses.nodes > 0:
+            logger.add_scalar('loss/train/infected', loss_bce_avg.get(), global_step=experiment.samples)
+        if experiment.session.losses.count > 0:
+            logger.add_scalar('loss/train/count', loss_count_avg.get(), global_step=experiment.samples)
+        if experiment.session.losses.l1 > 0:
+            logger.add_scalar('loss/train/l1', loss_l1_avg.get(), global_step=experiment.samples)
+
+    del train_bar, train_bar_postfix, loss_bce_avg, loss_count_avg, loss_l1_avg, loss_total_avg
     # endregion
 
     # region Validation loop
     model.eval()
-    loss_avg = RunningWeightedAverage()
-    stats_df = {k: [] for k in ['Loss', 'Nodes', 'Edges', 'Predict', 'Target', 'AvgPrecision', 'AreaROC']}
-    huge_dict = {'targets': [], 'results': []}
-    with torch.no_grad():
-        with tqdm.tqdm(desc=f'Val {experiment.epoch}', total=len(dataloader_val.dataset), unit='g') as bar:
-            for graphs, targets in dataloader_val:
-                graphs = graphs.to(experiment.session.device)
-                targets = targets.to(experiment.session.device)
+    torch.set_grad_enabled(False)
+    
+    val_bar_postfix = {}
+    loss_bce_avg = RunningWeightedAverage()
+    loss_count_avg = RunningWeightedAverage()
+    loss_total_avg = RunningWeightedAverage()
+    loss_l1 = sum([p.abs().sum() for p in model.parameters()])
+    val_bar_postfix['L1'] = f'{loss_l1.item():.5f}'
 
-                results = model(graphs)
-                losses = F.binary_cross_entropy_with_logits(
-                    results.node_features.squeeze(), targets.node_features.squeeze().float(), reduction='none')
-                loss_avg.add(losses.mean().item(), len(graphs))
+    val_bar = tqdm.tqdm(desc=f'Val {experiment.epoch}', total=len(dataloader_val.dataset), unit='g')
+    for batch_idx, (graphs, targets) in enumerate(dataloader_val):
+        graphs = graphs.to(experiment.session.device)
+        targets = targets.to(experiment.session.device)
+        results = model(graphs)
 
-                idx = tg.utils.segment_lengths_to_ids(graphs.num_nodes_by_graph)
-                losses_by_graph = torch_scatter.scatter_mean(
-                    losses, index=idx, dim=0, dim_size=graphs.num_graphs)
-                infected_by_graph_true = torch_scatter.scatter_add(
-                    targets.node_features.squeeze(), index=idx, dim=0, dim_size=graphs.num_graphs)
-                infected_by_graph_pred = torch_scatter.scatter_add(
-                    results.node_features.squeeze().sigmoid(), index=idx, dim=0, dim_size=graphs.num_graphs)
-                avg_prec_by_graph = []
-                area_roc_by_graph = []
-                for t, r in zip(targets.node_features_by_graph, results.node_features_by_graph):
-                    # numpy does not work with torch.int8
-                    avg_prec_by_graph.append(sklearn.metrics.average_precision_score(
+        loss_total = torch.tensor(0., device=experiment.session.device)
+
+        if experiment.session.losses.nodes > 0:
+            loss_bce = F.binary_cross_entropy_with_logits(
+                results.node_features.squeeze(), targets.node_features.squeeze().float(), reduction='mean')
+            loss_total += experiment.session.losses.nodes * loss_bce
+            loss_bce_avg.add(loss_bce.item(), len(graphs))
+            val_bar_postfix['Infected'] = f'{loss_bce.item():.5f}'
+
+        if experiment.session.losses.count > 0:
+            loss_count = F.mse_loss(
+                results.global_features.squeeze(), targets.global_features.squeeze().float(), reduction='mean')
+            loss_total += experiment.session.losses.count * loss_count
+            loss_count_avg.add(loss_count.item(), len(graphs))
+            val_bar_postfix['Count'] = f'{loss_count.item():.5f}'
+
+        if experiment.session.losses.l1 > 0:
+            loss_total += experiment.session.losses.l1 * loss_l1
+
+        val_bar_postfix['Total'] = f'{loss_total.item():.5f}'
+        loss_total_avg.add(loss_total.item(), len(graphs))
+
+        # region Last epoch
+        if epoch_idx == experiment.session.epochs:
+            loss_bce_by_graph = torch_scatter.scatter_mean(
+                F.binary_cross_entropy_with_logits(
+                    results.node_features.squeeze(), targets.node_features.squeeze().float(), reduction='none'),
+                index=tg.utils.segment_lengths_to_ids(graphs.num_nodes_by_graph),
+                dim=0,
+                dim_size=graphs.num_graphs
+            )
+            loss_count_by_graph = F.mse_loss(
+                results.global_features.squeeze(), targets.global_features.squeeze().float(), reduction='none')
+            infected_by_graph_start_true = torch_scatter.scatter_add(
+                results.node_features[:, 0],
+                index=tg.utils.segment_lengths_to_ids(graphs.num_nodes_by_graph),
+                dim=0,
+                dim_size=graphs.num_graphs
+            )
+            infected_by_graph_sum_pred = torch_scatter.scatter_add(
+                results.node_features.squeeze().sigmoid(),
+                index=tg.utils.segment_lengths_to_ids(graphs.num_nodes_by_graph),
+                dim=0,
+                dim_size=graphs.num_graphs
+            )
+            avg_prec_by_graph = []
+            area_roc_by_graph = []
+            for t, r in zip(targets.node_features_by_graph, results.node_features_by_graph):
+                avg_prec_by_graph.append(sklearn.metrics.average_precision_score(
+                    y_true=t.squeeze().cpu().int(),  # numpy does not work with torch.int8
+                    y_score=r.squeeze().sigmoid().cpu())
+                )
+                try:
+                    area_roc_by_graph.append(sklearn.metrics.roc_auc_score(
                         y_true=t.squeeze().cpu().int(),  # numpy does not work with torch.int8
                         y_score=r.squeeze().sigmoid().cpu())
                     )
-                    try:
-                        area_roc_by_graph.append(sklearn.metrics.roc_auc_score(
-                            y_true=t.squeeze().cpu().int(),  # numpy does not work with torch.int8
-                            y_score=r.squeeze().sigmoid().cpu())
-                        )
-                    except ValueError:
-                        # ValueError: Only one class present in y_true. ROC AUC score is not defined in that case.
-                        area_roc_by_graph.append(np.nan)
+                except ValueError:
+                    # ValueError: Only one class present in y_true. ROC AUC score is not defined in that case.
+                    area_roc_by_graph.append(np.nan)
+    
+            huge_dict['targets'].append(targets.node_features.squeeze().cpu())
+            huge_dict['results'].append(results.node_features.squeeze().sigmoid().cpu())
+    
+            stats_df['LossInfection'].append(loss_bce_by_graph.cpu())
+            stats_df['LossCount'].append(loss_count_by_graph.cpu())
+            stats_df['Nodes'].append(graphs.num_nodes_by_graph.cpu())
+            stats_df['Edges'].append(graphs.num_edges_by_graph.cpu())
+            stats_df['InfectedSum'].append(infected_by_graph_sum_pred.cpu())
+            stats_df['InfectedCount'].append(results.global_features.squeeze().cpu())
+            stats_df['InfectedStartTrue'].append(infected_by_graph_start_true.cpu())
+            stats_df['InfectedEndTrue'].append(targets.global_features.squeeze().cpu())
+            stats_df['AvgPrecision'].append(np.array(avg_prec_by_graph))
+            stats_df['AreaROC'].append(np.array(area_roc_by_graph))
+        # endregion
 
-                huge_dict['targets'].append(targets.node_features.squeeze().cpu())
-                huge_dict['results'].append(results.node_features.squeeze().sigmoid().cpu())
+        val_bar.update(len(graphs))
+        val_bar.set_postfix(val_bar_postfix)
+    val_bar.close()
 
-                stats_df['Loss'].append(losses_by_graph.cpu())
-                stats_df['Nodes'].append(graphs.num_nodes_by_graph.cpu())
-                stats_df['Edges'].append(graphs.num_edges_by_graph.cpu())
-                stats_df['Target'].append(infected_by_graph_true.cpu().int())  # numpy does not work with torch.int8
-                stats_df['Predict'].append(infected_by_graph_pred.cpu())
-                stats_df['AvgPrecision'].append(np.array(avg_prec_by_graph))
-                stats_df['AreaROC'].append(np.array(area_roc_by_graph))
-
-                bar.update(graphs.num_graphs)
-                bar.set_postfix_str(f'Loss: {losses.mean().item():.9f}')
-
-    logger.add_scalar('loss/val/bce', loss_avg.get(), global_step=experiment.samples)
-    epoch_bar_postfix['Val'] = f'{loss_avg.get():.4f}'
+    epoch_bar_postfix['Val'] = f'{loss_total_avg.get():.4f}'
     epoch_bar.set_postfix(epoch_bar_postfix)
+
+    if (
+            'every batch' in experiment.session.log.when or
+            'every epoch' in experiment.session.log.when or
+            'last epoch' in experiment.session.checkpoint.when and epoch_idx == experiment.session.epochs
+    ):
+        logger.add_scalar('loss/val/total', loss_total, global_step=experiment.samples)
+        if experiment.session.losses.nodes > 0:
+            logger.add_scalar('loss/val/infected', loss_bce_avg.get(), global_step=experiment.samples)
+        if experiment.session.losses.count > 0:
+            logger.add_scalar('loss/val/count', loss_count_avg.get(), global_step=experiment.samples)
+        if experiment.session.losses.l1 > 0:
+            logger.add_scalar('loss/val/l1', loss_l1.item(), global_step=experiment.samples)
+
+    del val_bar, val_bar_postfix, loss_bce_avg, loss_count_avg, loss_l1, loss_total, batch_idx
     # endregion
 
     # Saving
@@ -327,23 +430,26 @@ for epoch_idx in epoch_bar:
         experiment.session.status = 'DONE'
         experiment.session.datetime_completed = datetime.utcnow()
     if (
+            'every batch' in experiment.session.checkpoint.when or
             'every epoch' in experiment.session.checkpoint.when or
             'last epoch' in experiment.session.checkpoint.when and epoch_idx == experiment.session.epochs
     ):
         saver.save(model, experiment, optimizer, suffix=f'e{experiment.epoch:04d}')
 epoch_bar.close()
+del epoch_bar, epoch_bar_postfix, epoch_idx
 # endregion
 
 # region Final report
-targets = torch.cat(huge_dict['targets']).int()  # numpy does not work with torch.int8
-results = torch.cat(huge_dict['results'])
-del huge_dict
+huge_dict['targets'] = torch.cat(huge_dict['targets']).int()  # numpy does not work with torch.int8
+huge_dict['results'] = torch.cat(huge_dict['results'])
 
-experiment.average_precision = sklearn.metrics.average_precision_score(y_true=targets, y_score=results)
+experiment.average_precision = sklearn.metrics.average_precision_score(
+    y_true=huge_dict['targets'], y_score=huge_dict['results'])
 print('Average precision:', experiment.average_precision)
 if False:
     import matplotlib.pyplot as plt
-    precision, recall, _ = sklearn.metrics.precision_recall_curve(y_true=targets, probas_pred=results)
+    precision, recall, _ = sklearn.metrics.precision_recall_curve(
+        y_true=huge_dict['targets'], probas_pred=huge_dict['results'])
     plt.step(recall, precision, color='b', alpha=0.2, where='post')
     plt.fill_between(recall, precision, alpha=0.2, color='b', step='post')
     plt.xlabel('Recall')
@@ -353,9 +459,11 @@ if False:
     plt.title(f'Precision-Recall curve: AP={experiment.average_precision:.2f}')
     plt.show()
 if logger is not None:
-    logger.add_scalar('val/avg_precision', experiment.average_precision, global_step=experiment.samples)
-    logger.add_pr_curve('val/pr_curve', labels=targets, predictions=results, global_step=experiment.samples)
-del targets, results
+    logger.add_scalar('metrics/val/avg_precision', experiment.average_precision, global_step=experiment.samples)
+    logger.add_pr_curve('infection', labels=huge_dict['targets'],
+                        predictions=huge_dict['results'], global_step=experiment.samples)
+del huge_dict
+
 
 stats_df = pd.DataFrame({k: np.concatenate(v) for k, v in stats_df.items()}).rename_axis('GraphId').reset_index()
 
@@ -364,7 +472,7 @@ df_train_val = stats_df \
     .groupby(np.where(stats_df.Nodes < dataset_train.max_nodes,
                       f'Train [{dataset_train.min_nodes}, {dataset_train.max_nodes - 1})',
                       f'Val  [{dataset_train.max_nodes}, {dataset_val.max_nodes - 1})')) \
-    .agg({'Nodes': ['min', 'max'], 'GraphId': 'count', 'Loss': 'mean'}) \
+    .agg({'Nodes': ['min', 'max'], 'GraphId': 'count', 'LossInfection': 'mean', 'LossCount': 'mean'}) \
     .sort_index(ascending=False) \
     .rename_axis(index='Dataset') \
     .rename(str.capitalize, axis='columns', level=1)
@@ -372,54 +480,61 @@ df_train_val = stats_df \
 # Split the results in ranges based on the number of nodes and compute the average loss per range
 df_losses_by_node_range = stats_df \
     .groupby(stats_df.Nodes // 10) \
-    .agg({'Nodes': ['min', 'max'], 'GraphId': 'count', 'Loss': 'mean'}) \
+    .agg({'Nodes': ['min', 'max'], 'GraphId': 'count', 'LossInfection': 'mean', 'LossCount': 'mean'}) \
     .rename_axis(index='NodeRange') \
     .rename(lambda node_group_min: f'[{node_group_min * 10}, {node_group_min * 10 + 10})', axis='index') \
     .rename(str.capitalize, axis='columns', level=1)
 
-# Split the results in ranges based on the number of nodes and keep the N worst predictions
-df_worst_graphs_by_node_range = stats_df \
+# Split the results in ranges based on the number of nodes and keep the N worst predictions w.r.t. node-wise loss
+df_worst_infection_loss_by_node_range = stats_df \
     .groupby(stats_df.Nodes // 10) \
-    .apply(lambda df_gr: df_gr.nlargest(5, 'Loss').set_index('GraphId')) \
+    .apply(lambda df_gr: df_gr.nlargest(5, 'LossInfection').set_index('GraphId')) \
     .rename_axis(index={'Nodes': 'NodeRange'}) \
     .rename(lambda node_group_min: f'[{node_group_min * 10}, {node_group_min * 10 + 10})', axis='index', level=0)
 
-# Split the results in ranges based on the number of nodes and keep the N best predictions
-df_best_graphs_by_node_range = stats_df \
+# Split the results in ranges based on the number of nodes and keep the N worst predictions w.r.t. graph-wise loss
+df_worst_count_loss_by_node_range = stats_df \
     .groupby(stats_df.Nodes // 10) \
-    .apply(lambda df_gr: df_gr.nsmallest(3, 'Loss').set_index('GraphId')) \
+    .apply(lambda df_gr: df_gr.nlargest(5, 'LossCount').set_index('GraphId')) \
     .rename_axis(index={'Nodes': 'NodeRange'}) \
     .rename(lambda node_group_min: f'[{node_group_min * 10}, {node_group_min * 10 + 10})', axis='index', level=0)
 
-print('',
-      df_train_val.to_string(float_format=lambda x: f'{x:.2f}'),
-      df_losses_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'),
-      df_best_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'),
-      df_worst_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'),
-      sep='\n\n')
+pd.options.display.float_format = '{:.2f}'.format
+print(f"""
+Generalization:
+{df_train_val}\n
+Losses by range:
+{df_losses_by_node_range}\n
+Worst infection predictions:
+{df_worst_infection_loss_by_node_range}\n
+Worst count predictions:
+{df_worst_count_loss_by_node_range}
+""")
 
 if logger is not None:
     logger.add_text(
         'Generalization',
-        textwrap.indent(df_train_val.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
+        textwrap.indent(df_train_val.to_string(), '    '),
         global_step=experiment.samples)
     logger.add_text(
-        'Loss by range',
-        textwrap.indent(df_losses_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
+        'Losses by range',
+        textwrap.indent(df_losses_by_node_range.to_string(), '    '),
         global_step=experiment.samples)
     logger.add_text(
-        'Best predictions',
-        textwrap.indent(df_best_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
-        global_step=experiment.samples)
+        'Worst infection predictions',
+        textwrap.indent(df_worst_infection_loss_by_node_range.to_string(), '    '),
+        global_step=experiment.samples),
     logger.add_text(
-        'Worst predictions',
-        textwrap.indent(df_worst_graphs_by_node_range.to_string(float_format=lambda x: f'{x:.2f}'), '    '),
+        'Worst count predictions',
+        textwrap.indent(df_worst_count_loss_by_node_range.to_string(), '    '),
         global_step=experiment.samples)
+del stats_df, df_losses_by_node_range, df_worst_infection_loss_by_node_range, df_worst_count_loss_by_node_range
 
 params = [f'{name}:\n{param.data.cpu().numpy().round(3)}' for name, param in model.named_parameters()]
 print('Parameters:', *params, sep='\n\n')
 if logger is not None:
     logger.add_text('Parameters', textwrap.indent('\n\n'.join(params), '    '), global_step=experiment.samples)
+del params
 # endregion
 
 # region Cleanup

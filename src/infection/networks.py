@@ -13,7 +13,8 @@ class FullGN(nn.Module):
     def __init__(
             self,
             in_edge_features_shape, in_node_features_shape,
-            out_edge_features_shape, out_node_features_shape
+            out_edge_features_shape, out_node_features_shape,
+            out_global_features_shape
     ):
         super().__init__()
 
@@ -27,6 +28,10 @@ class FullGN(nn.Module):
         self.g_out = nn.Parameter(torch.Tensor(out_node_features_shape, out_edge_features_shape))
         self.g_bias = nn.Parameter(torch.Tensor(out_node_features_shape))
 
+        self.h_nodes = nn.Parameter(torch.Tensor(out_node_features_shape, out_global_features_shape))
+        self.h_edges = nn.Parameter(torch.Tensor(out_edge_features_shape, out_global_features_shape))
+        self.h_bias = nn.Parameter(torch.Tensor(out_global_features_shape))
+
         _reset_parameters(self)
 
     def forward(self, graphs: tg.GraphBatch):
@@ -36,20 +41,29 @@ class FullGN(nn.Module):
             (graphs.node_features @ self.f_receiver.t()).index_select(dim=0, index=graphs.receivers) +
             self.f_bias
         )
-        incoming_edges_agg = (torch_scatter.scatter_max(edges, graphs.receivers, dim=0, dim_size=graphs.num_nodes)[0])
-        outgoing_edges_agg = (torch_scatter.scatter_max(edges, graphs.senders, dim=0, dim_size=graphs.num_nodes)[0])
+        incoming_edges_agg = torch_scatter.scatter_max(edges, graphs.receivers, dim=0, dim_size=graphs.num_nodes)[0]
+        outgoing_edges_agg = torch_scatter.scatter_max(edges, graphs.senders, dim=0, dim_size=graphs.num_nodes)[0]
         nodes = (
                 graphs.node_features @ self.g_node.t() +
                 incoming_edges_agg @ self.g_in.t() +
                 outgoing_edges_agg @ self.g_out.t() +
                 self.g_bias
         )
+        edges_agg = torch_scatter.scatter_add(F.relu(edges), tg.utils.segment_lengths_to_ids(graphs.num_edges_by_graph),
+                                              dim=0, dim_size=graphs.num_graphs)
+        nodes_agg = torch_scatter.scatter_add(F.relu(nodes), tg.utils.segment_lengths_to_ids(graphs.num_nodes_by_graph),
+                                              dim=0, dim_size=graphs.num_graphs)
+        globals = (
+            edges_agg @ self.h_edges.t() +
+            nodes_agg @ self.h_nodes.t() +
+            self.h_bias
+        )
         return graphs.evolve(
             node_features=nodes,
             num_edges=0,
             num_edges_by_graph=None,
             edge_features=None,
-            global_features=None,
+            global_features=globals,
             senders=None,
             receivers=None
         )
@@ -59,7 +73,8 @@ class MinimalGN(nn.Module):
     def __init__(
             self,
             in_edge_features_shape, in_node_features_shape,
-            out_edge_features_shape, out_node_features_shape
+            out_edge_features_shape, out_node_features_shape,
+            out_global_features_shape
     ):
         super().__init__()
 
@@ -70,6 +85,9 @@ class MinimalGN(nn.Module):
         self.g_in = nn.Parameter(torch.Tensor(out_node_features_shape, out_edge_features_shape))
         self.g_bias = nn.Parameter(torch.Tensor(out_node_features_shape))
 
+        self.h_nodes = nn.Parameter(torch.Tensor(out_node_features_shape, out_global_features_shape))
+        self.h_bias = nn.Parameter(torch.Tensor(out_global_features_shape))
+
         _reset_parameters(self)
 
     def forward(self, graphs: tg.GraphBatch):
@@ -83,12 +101,18 @@ class MinimalGN(nn.Module):
                 incoming_edges_agg @ self.g_in.t() +
                 self.g_bias
         )
+        nodes_agg = torch_scatter.scatter_add(F.relu(nodes), tg.utils.segment_lengths_to_ids(graphs.num_nodes_by_graph),
+                                              dim=0, dim_size=graphs.num_graphs)
+        globals = (
+                nodes_agg @ self.h_nodes.t() +
+                self.h_bias
+        )
         return graphs.evolve(
             node_features=nodes,
             num_edges=0,
             edge_features=None,
             num_edges_by_graph=None,
-            global_features=None,
+            global_features=globals,
             senders=None,
             receivers=None
         )
@@ -98,8 +122,8 @@ class SubMinimalGN(nn.Module):
     def __init__(
             self,
             in_edge_features_shape, in_node_features_shape,
-            out_edge_features_shape, out_node_features_shape
-    ):
+            out_edge_features_shape, out_node_features_shape,
+            out_global_features_shape):
         super().__init__()
 
         self.f_sender = nn.Parameter(torch.Tensor(out_edge_features_shape, in_node_features_shape))
@@ -107,6 +131,9 @@ class SubMinimalGN(nn.Module):
 
         self.g_in = nn.Parameter(torch.Tensor(out_node_features_shape, out_edge_features_shape))
         self.g_bias = nn.Parameter(torch.Tensor(out_node_features_shape))
+
+        self.h_nodes = nn.Parameter(torch.Tensor(out_node_features_shape, out_global_features_shape))
+        self.h_bias = nn.Parameter(torch.Tensor(out_global_features_shape))
 
         _reset_parameters(self)
 
@@ -120,12 +147,18 @@ class SubMinimalGN(nn.Module):
                 incoming_edges_agg @ self.g_in.t() +
                 self.g_bias
         )
+        nodes_agg = torch_scatter.scatter_add(F.relu(nodes), tg.utils.segment_lengths_to_ids(graphs.num_nodes_by_graph),
+                                              dim=0, dim_size=graphs.num_graphs)
+        globals = (
+                nodes_agg @ self.h_nodes.t() +
+                self.h_bias
+        )
         return graphs.evolve(
             node_features=nodes,
             num_edges=0,
             edge_features=None,
             num_edges_by_graph=None,
-            global_features=None,
+            global_features=globals,
             senders=None,
             receivers=None
         )
