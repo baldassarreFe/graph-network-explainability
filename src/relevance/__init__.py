@@ -88,12 +88,22 @@ class Cat(RelevanceFunction):
         return torch.split(rel_out, split_size_or_sections=shapes, dim=dim)
 
 
-class Dense(RelevanceFunction):
+class DenseRelevanceFunction(RelevanceFunction):
     def __init__(self, W, b):
-        super(Dense, self).__init__()
+        super(DenseRelevanceFunction, self).__init__()
         self.W = W
         self.b = b
 
+
+class DenseW2(DenseRelevanceFunction):
+    def forward(self, x):
+        return x @ self.W.t() + self.b
+
+    def relevance(self, rel_out):
+        return rel_out @ (self.W.pow(2) / (self.W.pow(2).sum(dim=1, keepdim=True) + 10e-6))
+
+
+class DenseZPlus(DenseRelevanceFunction):
     def forward(self, x):
         self.saved_stuff = x
         output = x @ self.W.t() + self.b
