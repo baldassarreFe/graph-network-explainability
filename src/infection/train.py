@@ -236,7 +236,7 @@ experiment.session.status = 'RUNNING'
 experiment.session.datetime_started = datetime.utcnow()
 
 graphs_df = {k: [] for k in ['LossInfection', 'LossCount', 'Nodes', 'Edges', 'InfectedStart', 'InfectedEnd',
-                             'InfectedSum', 'InfectedCount', 'AvgPrecision', 'AreaROC']}
+                             'InfectedSum', 'InfectedCount', 'MeanPercError', 'AvgPrecision', 'AreaROC']}
 nodes_df = {k: [] for k in ['Targets', 'Results']}
 
 epoch_bar_postfix = {}
@@ -249,6 +249,7 @@ for epoch_idx in epoch_bar:
     torch.set_grad_enabled(True)
 
     train_bar_postfix = {}
+    metric_mpe_avg = RunningWeightedAverage()
     loss_bce_avg = RunningWeightedAverage()
     loss_count_avg = RunningWeightedAverage()
     loss_l1_avg = RunningWeightedAverage()
@@ -278,8 +279,14 @@ for epoch_idx in epoch_bar:
             loss_total += experiment.session.losses.count * torch.mean(loss_count * weights)
             loss_count_avg.add(loss_count.mean().item(), len(graphs))
             train_bar_postfix['Count'] = f'{loss_count.mean().item():.5f}'
+
+            metric_mpe = ((results.global_features - targets.global_features.float()).abs() /
+                          targets.global_features.float()).mean()
+            metric_mpe_avg.add(metric_mpe,len(graphs))
+
             if 'every batch' in experiment.session.log.when:
                 logger.add_scalar('loss/train/count', loss_count.mean().item(), global_step=experiment.samples)
+                logger.add_scalar('metric/train/mpe', metric_mpe.item(), global_step=experiment.samples)
 
         if experiment.session.losses.l1 > 0:
             loss_l1 = sum([p.abs().sum() for p in model.parameters()])
@@ -312,10 +319,11 @@ for epoch_idx in epoch_bar:
             logger.add_scalar('loss/train/infected', loss_bce_avg.get(), global_step=experiment.samples)
         if experiment.session.losses.count > 0:
             logger.add_scalar('loss/train/count', loss_count_avg.get(), global_step=experiment.samples)
+            logger.add_scalar('metric/train/mpe', metric_mpe_avg.get(), global_step=experiment.samples)
         if experiment.session.losses.l1 > 0:
             logger.add_scalar('loss/train/l1', loss_l1_avg.get(), global_step=experiment.samples)
 
-    del train_bar, train_bar_postfix, loss_bce_avg, loss_count_avg, loss_l1_avg, loss_total_avg
+    del train_bar, train_bar_postfix, loss_bce_avg, loss_count_avg, loss_l1_avg, loss_total_avg, metric_mpe_avg
     # endregion
 
     # region Validation loop
@@ -323,6 +331,7 @@ for epoch_idx in epoch_bar:
     torch.set_grad_enabled(False)
 
     val_bar_postfix = {}
+    metric_mpe_avg = RunningWeightedAverage()
     loss_bce_avg = RunningWeightedAverage()
     loss_count_avg = RunningWeightedAverage()
     loss_total_avg = RunningWeightedAverage()
@@ -351,6 +360,12 @@ for epoch_idx in epoch_bar:
             loss_count_avg.add(loss_count.item(), len(graphs))
             val_bar_postfix['Count'] = f'{loss_count.item():.5f}'
 
+            metric_mpe_avg.add(
+                ((results.global_features - targets.global_features.float()).abs() /
+                 targets.global_features.float()).mean(),
+                len(graphs)
+            )
+
         if experiment.session.losses.l1 > 0:
             loss_total += experiment.session.losses.l1 * loss_l1
 
@@ -368,8 +383,12 @@ for epoch_idx in epoch_bar:
             )
             loss_count_by_graph = F.mse_loss(
                 results.global_features.squeeze(), targets.global_features.squeeze().float(), reduction='none')
+            mpe_by_graph = (
+                    (results.global_features - targets.global_features.float()).abs() /
+                    targets.global_features.float()
+            ).squeeze()
             infected_by_graph_start_true = torch_scatter.scatter_add(
-                graphs.node_features[:, 0].int(),
+                graphs.node_features[:, 0].int().clamp(min=0),
                 index=tg.utils.segment_lengths_to_ids(graphs.num_nodes_by_graph),
                 dim=0,
                 dim_size=graphs.num_graphs
@@ -407,6 +426,7 @@ for epoch_idx in epoch_bar:
             graphs_df['InfectedEnd'].append(targets.global_features.squeeze().cpu())
             graphs_df['InfectedSum'].append(infected_by_graph_sum_pred.cpu())
             graphs_df['InfectedCount'].append(results.global_features.squeeze().cpu())
+            graphs_df['MeanPercError'].append(mpe_by_graph.cpu())
             graphs_df['AvgPrecision'].append(np.array(avg_prec_by_graph))
             graphs_df['AreaROC'].append(np.array(area_roc_by_graph))
         # endregion
@@ -428,10 +448,11 @@ for epoch_idx in epoch_bar:
             logger.add_scalar('loss/val/infected', loss_bce_avg.get(), global_step=experiment.samples)
         if experiment.session.losses.count > 0:
             logger.add_scalar('loss/val/count', loss_count_avg.get(), global_step=experiment.samples)
+            logger.add_scalar('metric/val/mpe', metric_mpe_avg.get(), global_step=experiment.samples)
         if experiment.session.losses.l1 > 0:
             logger.add_scalar('loss/val/l1', loss_l1.item(), global_step=experiment.samples)
 
-    del val_bar, val_bar_postfix, loss_bce_avg, loss_count_avg, loss_l1, loss_total_avg, batch_idx
+    del val_bar, val_bar_postfix, loss_bce_avg, loss_count_avg, loss_l1, loss_total_avg, metric_mpe_avg, batch_idx
     # endregion
 
     # Saving
@@ -462,9 +483,11 @@ if logger is not None:
     logger.add_scalar('metrics/val/avg_precision', experiment.average_precision, global_step=experiment.samples)
     logger.add_pr_curve('infection', labels=nodes_df.Targets.values,
                         predictions=nodes_df.Results.values, global_step=experiment.samples)
+
 # noinspection PyUnreachableCode
 if False:
     import matplotlib.pyplot as plt
+
     precision, recall, _ = sklearn.metrics.precision_recall_curve(
         y_true=nodes_df.Targets, probas_pred=nodes_df.Results)
     plt.step(recall, precision, color='b', alpha=0.2, where='post')
@@ -480,8 +503,10 @@ del nodes_df
 graphs_df = pd.DataFrame({k: np.concatenate(v) for k, v in graphs_df.items()}).rename_axis('GraphId').reset_index()
 experiment.loss_count = graphs_df.LossCount.mean()
 experiment.loss_infection = graphs_df.LossInfection.mean()
+experiment.mpe = graphs_df.MeanPercError.mean()
 print('Count MSE:', experiment.loss_count)
 print('Infection BCE:', experiment.loss_infection)
+print('Count MPE:', experiment.average_precision)
 
 # Split the results based on whether the number of nodes was present in the training set or not
 df_train_val = graphs_df \
