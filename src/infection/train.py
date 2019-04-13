@@ -208,12 +208,20 @@ dataloader_kwargs = dict(
     batch_size=experiment.session.batch_size,
     collate_fn=tg.GraphBatch.collate,
 )
+
 dataset_train: InfectionDataset = torch.load(Path(experiment.session.data.folder) / 'train.pt')
 dataloader_train = torch.utils.data.DataLoader(
     dataset_train,
     shuffle=True,
     **dataloader_kwargs
 )
+count_weights = pd.Series(t.global_features.item() for g, t in dataset_train) \
+    .value_counts(normalize=True) \
+    .apply(np.log) \
+    .apply(np.negative) \
+    .astype(np.float32) \
+    .sort_index()
+
 dataset_val: InfectionDataset = torch.load(Path(experiment.session.data.folder) / 'val.pt')
 dataloader_val = torch.utils.data.DataLoader(
     dataset_val,
@@ -239,14 +247,14 @@ for epoch_idx in epoch_bar:
     # region Training loop
     model.train()
     torch.set_grad_enabled(True)
-    
+
     train_bar_postfix = {}
     loss_bce_avg = RunningWeightedAverage()
     loss_count_avg = RunningWeightedAverage()
     loss_l1_avg = RunningWeightedAverage()
     loss_total_avg = RunningWeightedAverage()
 
-    train_bar = tqdm.tqdm(desc=f'Train {experiment.epoch}', total=len(dataloader_train.dataset), unit='g') 
+    train_bar = tqdm.tqdm(desc=f'Train {experiment.epoch}', total=len(dataloader_train.dataset), unit='g')
     for graphs, targets in dataloader_train:
         graphs = graphs.to(experiment.session.device)
         targets = targets.to(experiment.session.device)
@@ -265,12 +273,13 @@ for epoch_idx in epoch_bar:
 
         if experiment.session.losses.count > 0:
             loss_count = F.mse_loss(
-                results.global_features.squeeze(), targets.global_features.squeeze().float(), reduction='mean')
-            loss_total += experiment.session.losses.count * loss_count
-            loss_count_avg.add(loss_count.item(), len(graphs))
-            train_bar_postfix['Count'] = f'{loss_count.item():.5f}'
+                results.global_features.squeeze(), targets.global_features.squeeze().float(), reduction='none')
+            weights = loss_count.new_tensor(count_weights.loc[targets.global_features.squeeze().cpu().numpy()].values)
+            loss_total += experiment.session.losses.count * torch.mean(loss_count * weights)
+            loss_count_avg.add(loss_count.mean().item(), len(graphs))
+            train_bar_postfix['Count'] = f'{loss_count.mean().item():.5f}'
             if 'every batch' in experiment.session.log.when:
-                logger.add_scalar('loss/train/count', loss_count.item(), global_step=experiment.samples)
+                logger.add_scalar('loss/train/count', loss_count.mean().item(), global_step=experiment.samples)
 
         if experiment.session.losses.l1 > 0:
             loss_l1 = sum([p.abs().sum() for p in model.parameters()])
@@ -312,7 +321,7 @@ for epoch_idx in epoch_bar:
     # region Validation loop
     model.eval()
     torch.set_grad_enabled(False)
-    
+
     val_bar_postfix = {}
     loss_bce_avg = RunningWeightedAverage()
     loss_count_avg = RunningWeightedAverage()
@@ -386,10 +395,10 @@ for epoch_idx in epoch_bar:
                 except ValueError:
                     # ValueError: Only one class present in y_true. ROC AUC score is not defined in that case.
                     area_roc_by_graph.append(np.nan)
-    
+
             nodes_df['Targets'].append(targets.node_features.squeeze().cpu().int())  # numpy doesn't convert torch.int8
             nodes_df['Results'].append(results.node_features.squeeze().sigmoid().cpu())
-    
+
             graphs_df['LossInfection'].append(loss_bce_by_graph.cpu())
             graphs_df['LossCount'].append(loss_count_by_graph.cpu())
             graphs_df['Nodes'].append(graphs.num_nodes_by_graph.cpu())
@@ -441,7 +450,9 @@ del epoch_bar, epoch_bar_postfix, epoch_idx
 # endregion
 
 # region Final report
-pd.options.display.float_format = '{:.2f}'.format
+pd.options.display.precision = 2
+pd.options.display.max_columns = 999
+pd.options.display.expand_frame_repr = False
 
 nodes_df = pd.DataFrame({k: np.concatenate(v) for k, v in nodes_df.items()})
 experiment.average_precision = sklearn.metrics.average_precision_score(
@@ -470,7 +481,7 @@ graphs_df = pd.DataFrame({k: np.concatenate(v) for k, v in graphs_df.items()}).r
 experiment.loss_count = graphs_df.LossCount.mean()
 experiment.loss_infection = graphs_df.LossInfection.mean()
 print('Count MSE:', experiment.loss_count)
-print('Infection BCe:', experiment.loss_infection)
+print('Infection BCE:', experiment.loss_infection)
 
 # Split the results based on whether the number of nodes was present in the training set or not
 df_train_val = graphs_df \
