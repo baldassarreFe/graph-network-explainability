@@ -62,25 +62,19 @@ For this task, the minimal version of the network should only use:
        --model ../config/infection/minimal.yaml
        
     conda activate tg-experiments
-    for i in $(seq  0 2); do
-      for type in subminimal minimal full; do
-        for lr in .01 .001; do
-          for l1 in 0 .0001; do
-            for infection in 1 10; do
-              for count in .01 .001; do
-                python -m infection.train \
-                       --experiment \
-                         ../config/infection/train.yaml \
-                         "tags=[${type},lr${lr},nodes${infection},count${count},l1${l1}]" \
-                       --model "../config/infection/${type}.yaml" \
-                       --optimizer "kwargs.lr=${lr}" \
-                       --session "losses.l1=${l1}" "losses.nodes=${infection}" "losses.count=${count}"
-              done
-            done
-          done
-        done
-      done
-    done
+    parallel --eta --max-procs 6 --load 80% --noswap \
+    'export CUDA_VISIBLE_DEVICES=$(expr {#} % 6) &&
+     python -m infection.train \
+        --experiment ../config/infection/train.yaml \
+                     "tags=[{1},lr{2},nodes{4},count{5},wd{1}]" \
+        --model "../config/infection/{0}.yaml" \
+        --optimizer "kwargs.lr={2}" \
+        --session "losses.l1={3}" "losses.nodes={4}" "losses.count={5}"' \
+    `# Architecture`   ::: subminimal minimal full \
+    `# Learning rate`  ::: .01 .001 \
+    `# L1 loss`        ::: 0   .0001 \
+    `# Infection loss` ::: 1   10  \
+    `# Count loss`     ::: .01 .001
     ```
 6. Query logs and visualize
    - Tensorboard: `tensorboard --logdir "$INFECTION/runs"`
