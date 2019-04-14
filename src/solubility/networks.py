@@ -11,7 +11,7 @@ def build_network(num_hidden):
 
 
 class SolubilityGN(nn.Module):
-    def __init__(self, num_layers, hidden_bias, hidden_node):
+    def __init__(self, num_layers, hidden_bias, hidden_node, dropout):
         super().__init__()
 
         hidden_edge = hidden_node // 4
@@ -26,20 +26,39 @@ class SolubilityGN(nn.Module):
                                       edge_features=hidden_edge, aggregation='mean'),
             'global_relu': tg.GlobalReLU(),
         }))
-        self.hidden = nn.Sequential(OrderedDict({
-            f'hidden_{i}': nn.Sequential(OrderedDict({
-                'edge': tg.EdgeLinear(hidden_edge, edge_features=hidden_edge,
-                                      sender_features=hidden_node, bias=hidden_bias),
-                'edge_relu': tg.EdgeReLU(),
-                'node': tg.NodeLinear(hidden_node, node_features=hidden_node, incoming_features=hidden_edge,
-                                      aggregation='mean', bias=hidden_bias),
-                'node_relu': tg.NodeReLU(),
-                'global': tg.GlobalLinear(hidden_global, node_features=hidden_node, edge_features=hidden_edge,
-                                          global_features=hidden_global, aggregation='mean', bias=hidden_bias),
-                'global_relu': tg.GlobalReLU(),
+        if dropout:
+            self.hidden = nn.Sequential(OrderedDict({
+                f'hidden_{i}': nn.Sequential(OrderedDict({
+                    'edge': tg.EdgeLinear(hidden_edge, edge_features=hidden_edge,
+                                          sender_features=hidden_node, bias=hidden_bias),
+                    'edge_relu': tg.EdgeReLU(),
+                    'edge_dropout': tg.EdgeDroput(),
+                    'node': tg.NodeLinear(hidden_node, node_features=hidden_node, incoming_features=hidden_edge,
+                                          aggregation='mean', bias=hidden_bias),
+                    'node_relu': tg.NodeReLU(),
+                    'node_dropout': tg.EdgeDroput(),
+                    'global': tg.GlobalLinear(hidden_global, node_features=hidden_node, edge_features=hidden_edge,
+                                              global_features=hidden_global, aggregation='mean', bias=hidden_bias),
+                    'global_relu': tg.GlobalReLU(),
+                    'global_dropout': tg.EdgeDroput(),
+                }))
+                for i in range(num_layers)
             }))
-            for i in range(num_layers)
-        }))
+        else:
+            self.hidden = nn.Sequential(OrderedDict({
+                f'hidden_{i}': nn.Sequential(OrderedDict({
+                    'edge': tg.EdgeLinear(hidden_edge, edge_features=hidden_edge,
+                                          sender_features=hidden_node, bias=hidden_bias),
+                    'edge_relu': tg.EdgeReLU(),
+                    'node': tg.NodeLinear(hidden_node, node_features=hidden_node, incoming_features=hidden_edge,
+                                          aggregation='mean', bias=hidden_bias),
+                    'node_relu': tg.NodeReLU(),
+                    'global': tg.GlobalLinear(hidden_global, node_features=hidden_node, edge_features=hidden_edge,
+                                              global_features=hidden_global, aggregation='mean', bias=hidden_bias),
+                    'global_relu': tg.GlobalReLU(),
+                }))
+                for i in range(num_layers)
+            }))
         self.readout_globals = tg.GlobalLinear(1, global_features=hidden_global, bias=True)
 
     def forward(self, graphs):
