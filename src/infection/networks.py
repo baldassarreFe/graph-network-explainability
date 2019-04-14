@@ -1,4 +1,5 @@
 import math
+from collections import OrderedDict
 
 import torch_scatter
 
@@ -7,6 +8,41 @@ from torch import nn
 import torch.nn.functional as F
 
 import torchgraphs as tg
+
+
+class AdHoc(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = nn.Sequential(OrderedDict({
+            'edge': tg.EdgeLinear(4, edge_features=2, bias=False),
+            'edge_relu': tg.EdgeReLU(),
+            'node': tg.NodeLinear(8, node_features=4, bias=False),
+            'node_relu': tg.NodeReLU(),
+        }))
+        self.hidden = nn.Sequential(OrderedDict({
+            'edge': tg.EdgeLinear(8, edge_features=4, sender_features=8, bias=False),
+            'edge_relu': tg.EdgeReLU(),
+            'node': tg.NodeLinear(8, node_features=8, incoming_features=8, aggregation='max', bias=False),
+            'node_relu': tg.NodeReLU()
+        }))
+        self.readout_nodes = tg.NodeLinear(1, node_features=8, bias=True)
+        self.readout_globals = tg.GlobalLinear(1, node_features=8, aggregation='sum', bias=False)
+
+    def forward(self, graphs):
+        graphs = self.encoder(graphs)
+        graphs = self.hidden(graphs)
+        nodes = self.readout_nodes(graphs).node_features
+        globals = self.readout_globals(graphs).global_features
+
+        return graphs.evolve(
+            node_features=nodes,
+            num_edges=0,
+            num_edges_by_graph=None,
+            edge_features=None,
+            global_features=globals,
+            senders=None,
+            receivers=None
+        )
 
 
 class FullGN(nn.Module):
@@ -54,9 +90,9 @@ class FullGN(nn.Module):
         nodes_agg = torch_scatter.scatter_add(F.relu(nodes), tg.utils.segment_lengths_to_ids(graphs.num_nodes_by_graph),
                                               dim=0, dim_size=graphs.num_graphs)
         globals = (
-            edges_agg @ self.h_edges.t() +
-            nodes_agg @ self.h_nodes.t() +
-            self.h_bias
+                edges_agg @ self.h_edges.t() +
+                nodes_agg @ self.h_nodes.t() +
+                self.h_bias
         )
         return graphs.evolve(
             node_features=nodes,
@@ -164,8 +200,8 @@ class SubMinimalGN(nn.Module):
         )
 
 
-def _reset_parameters(gn):
-    for name, param in gn.named_parameters():
+def _reset_parameters(module):
+    for name, param in module.named_parameters():
         if 'bias' in name:
             bound = 1 / math.sqrt(param.numel())
             nn.init.uniform_(param, -bound, bound)

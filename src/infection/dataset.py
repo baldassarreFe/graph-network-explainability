@@ -9,7 +9,7 @@ import torchgraphs as tg
 
 
 class InfectionDataset(torch.utils.data.Dataset):
-    def __init__(self, max_percent_immune, max_percent_sick, min_nodes, max_nodes):
+    def __init__(self, max_percent_immune, max_percent_sick, max_percent_virtual, min_nodes, max_nodes):
         if max_percent_sick + max_percent_immune > 1:
             raise ValueError(f"Cannot have a population with `max_percent_sick`={max_percent_sick}"
                              f"and `max_percent_immune`={max_percent_immune}")
@@ -17,6 +17,7 @@ class InfectionDataset(torch.utils.data.Dataset):
         self.max_nodes = max_nodes
         self.max_percent_immune = max_percent_immune
         self.max_percent_sick = max_percent_sick
+        self.max_percent_virtual = max_percent_virtual
         self.node_features_shape = 4
         self.edge_features_shape = 2
         self.samples: List[Tuple[tg.Graph, tg.Graph]] = []
@@ -31,23 +32,44 @@ class InfectionDataset(torch.utils.data.Dataset):
         num_nodes = np.random.randint(self.min_nodes, self.max_nodes)
         g_nx = nx.barabasi_albert_graph(num_nodes, 2).to_directed()
 
-        # At least one sick
+        # Remove some edges
+        num_edges = int(.7 * g_nx.number_of_edges())
+        edges_to_remove = np.random.choice(g_nx.number_of_edges(),
+                                           size=g_nx.number_of_edges() - num_edges, replace=False)
+        edges_to_remove = [list(g_nx.edges)[i] for i in edges_to_remove]
+        g_nx.remove_edges_from(edges_to_remove)
+
+        # Create node features: sick (at least one), immune and at risk
         num_sick = np.random.randint(1, max(1, int(num_nodes * self.max_percent_sick)) + 1)
         num_immune = np.random.randint(0, int(num_nodes * self.max_percent_immune) + 1)
         sick, immune, atrisk = np.split(g_nx.nodes, [num_sick, num_sick + num_immune])
 
-        node_features = torch.zeros(num_nodes, self.node_features_shape)
+        node_features = torch.empty(num_nodes, self.node_features_shape)
+        node_features[:, :2] = -1
         node_features[sick, 0] = 1
         node_features[immune, 1] = 1
-        node_features[:, 2:].uniform_()
+        node_features[:, 2:].uniform_(-1, 1)
 
-        edge_features = torch.rand(g_nx.number_of_edges(), self.edge_features_shape)
+        # Create edge features: in person and virtual
+        num_virtual = np.random.randint(0, int(num_edges * self.max_percent_virtual) + 1)
+        virtual = np.random.randint(0, num_edges, size=num_virtual)
+        edge_features = torch.empty(num_edges, self.edge_features_shape)
+        edge_features[:, 0] = -1
+        edge_features[virtual, 0] = 1
+        edge_features[:, 1:].uniform_(-1, 1)
 
         g = tg.Graph.from_networkx(g_nx).evolve(node_features=node_features, edge_features=edge_features)
 
+        # Create target by spreading the infection to the non-virtual neighbors who are not immune
+        virtual = {list(g_nx.edges)[i] for i in virtual}
+        infected = list({
+            infection_target for infection_src in sick for infection_target in g_nx.neighbors(infection_src)
+            if infection_target not in immune and (infection_src, infection_target) not in virtual
+        })
+
         target = torch.zeros((num_nodes, 1), dtype=torch.int8)
         target[sick] = 1
-        target[list({n for s in sick for n in g_nx.neighbors(s) if n not in immune})] = 1
+        target[infected] = 1
         target = tg.Graph(node_features=target, global_features=target.sum(dim=0))
 
         return g, target
