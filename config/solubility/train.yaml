@@ -1,0 +1,32 @@
+name: solubility
+
+model:
+  fn: solubility.networks.SolubilityGN
+  kwargs:
+    num_layers: 2
+    hidden_bias: yes
+    hidden_node: 16
+
+optimizer:
+  fn: torch.optim.Adam
+  kwargs:
+    lr: .001
+
+session:
+  epochs: 20
+  batch_size: 50
+  losses:
+    solubility: 1
+    l1: 0
+  data:
+    path: ~/experiments/{name}/data/delaney-processed.csv
+    train: .7
+    val: .3
+  log:
+    folder: ~/experiments/{name}/runs/{tags}_{rand}
+    when:
+      - every batch
+  checkpoint:
+    folder: ~/experiments/{name}/runs/{tags}_{rand}
+    when:
+      - last epoch
