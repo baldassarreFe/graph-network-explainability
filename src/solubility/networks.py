@@ -11,7 +11,7 @@ def build_network(num_hidden):
 
 
 class SolubilityGN(nn.Module):
-    def __init__(self, num_layers, hidden_bias, hidden_node, dropout):
+    def __init__(self, num_layers, hidden_bias, hidden_node, dropout, aggregation):
         super().__init__()
 
         hidden_edge = hidden_node // 4
@@ -23,7 +23,7 @@ class SolubilityGN(nn.Module):
             'node': tg.NodeLinear(hidden_node, node_features=47),
             'node_relu': tg.NodeReLU(),
             'global': tg.GlobalLinear(hidden_global, node_features=hidden_node,
-                                      edge_features=hidden_edge, aggregation='mean'),
+                                      edge_features=hidden_edge, aggregation=aggregation),
             'global_relu': tg.GlobalReLU(),
         }))
         if dropout:
@@ -34,11 +34,11 @@ class SolubilityGN(nn.Module):
                     'edge_relu': tg.EdgeReLU(),
                     'edge_dropout': tg.EdgeDroput(),
                     'node': tg.NodeLinear(hidden_node, node_features=hidden_node, incoming_features=hidden_edge,
-                                          aggregation='mean', bias=hidden_bias),
+                                          aggregation=aggregation, bias=hidden_bias),
                     'node_relu': tg.NodeReLU(),
                     'node_dropout': tg.EdgeDroput(),
                     'global': tg.GlobalLinear(hidden_global, node_features=hidden_node, edge_features=hidden_edge,
-                                              global_features=hidden_global, aggregation='mean', bias=hidden_bias),
+                                              global_features=hidden_global, aggregation=aggregation, bias=hidden_bias),
                     'global_relu': tg.GlobalReLU(),
                     'global_dropout': tg.EdgeDroput(),
                 }))
@@ -51,10 +51,10 @@ class SolubilityGN(nn.Module):
                                           sender_features=hidden_node, bias=hidden_bias),
                     'edge_relu': tg.EdgeReLU(),
                     'node': tg.NodeLinear(hidden_node, node_features=hidden_node, incoming_features=hidden_edge,
-                                          aggregation='mean', bias=hidden_bias),
+                                          aggregation=aggregation, bias=hidden_bias),
                     'node_relu': tg.NodeReLU(),
                     'global': tg.GlobalLinear(hidden_global, node_features=hidden_node, edge_features=hidden_edge,
-                                              global_features=hidden_global, aggregation='mean', bias=hidden_bias),
+                                              global_features=hidden_global, aggregation=aggregation, bias=hidden_bias),
                     'global_relu': tg.GlobalReLU(),
                 }))
                 for i in range(num_layers)
