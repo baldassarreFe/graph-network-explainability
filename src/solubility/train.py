@@ -286,6 +286,7 @@ for epoch_idx in epoch_bar:
         train_bar.set_postfix(train_bar_postfix)
     train_bar.close()
 
+    experiment.loss_sol_train = loss_sol_avg.get()
     epoch_bar_postfix['Train'] = f'{loss_total_avg.get():.4f}'
     epoch_bar.set_postfix(epoch_bar_postfix)
 
@@ -347,6 +348,7 @@ for epoch_idx in epoch_bar:
         val_bar.set_postfix(val_bar_postfix)
     val_bar.close()
 
+    experiment.loss_sol_val = loss_sol_avg.get()
     epoch_bar_postfix['Val'] = f'{loss_total_avg.get():.4f}'
     epoch_bar.set_postfix(epoch_bar_postfix)
 
