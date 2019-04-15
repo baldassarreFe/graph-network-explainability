@@ -55,28 +55,28 @@ For this task, the minimal version of the network should only use:
     docker network inspect bridge
     ```
    
-5. Launch experiments
+5. Launch experiments (use bash)
     ```bash
     python -m infection.train \
        --experiment ../config/infection/train.yaml \
        --model ../config/infection/minimal.yaml
        
     conda activate tg-experiments
-    parallel --eta --max-procs 6 --load 80% --noswap \
-    'export CUDA_VISIBLE_DEVICES=$(expr {#} % 6) &&
-     python -m infection.train \
-        --experiment ../config/infection/train.yaml \
-                     "tags=[{1},lr{2},nodes{4},count{5},wd{1}]" \
-        --model "../config/infection/{0}.yaml" \
-        --optimizer "kwargs.lr={2}" \
-        --session "losses.l1={3}" "losses.nodes={4}" "losses.count={5}"' \
-    `# Architecture`   ::: subminimal minimal full \
+    function train {
+       python -m infection.train \
+               --experiment ../config/infection/train.yaml \
+                            "tags=[${1},lr${2},nodes${4},count${5},wd${3}]" \
+               --model "../config/infection/${1}.yaml" \
+               --optimizer "kwargs.lr=${2}" \
+               --session "losses.l1=${3}" "losses.nodes=${4}" "losses.count=${5}"  
+    }    
+    export -f train
+    parallel --eta --max-procs 6 --load 80% --noswap 'export CUDA_VISIBLE_DEVICES=5 && train {1} {2} {3} {4} {5}' \
+    `# Architecture`   ::: adhoc \
     `# Learning rate`  ::: .01 .001 \
     `# L1 loss`        ::: 0   .0001 \
-    `# Infection loss` ::: 1   10  \
-    `# Count loss`     ::: .01 .001
+    `# Infection loss` ::: 1 .1 \
+    `# Count loss`     ::: 1 .1
     ```
 6. Query logs and visualize
    - Tensorboard: `tensorboard --logdir "$INFECTION/runs"`
-   - Mongo shell `docker run -it --rm mongo mongo <dbaddr:dbport>/sacred`
-   - Omniboard `docker run -it --rm -p 9000:9000 --name omniboard vivekratnavel/omniboard -m 172.17.0.2:27017:sacred`

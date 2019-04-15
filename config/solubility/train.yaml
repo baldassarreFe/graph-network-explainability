@@ -6,6 +6,7 @@ model:
     num_layers: 2
     hidden_bias: yes
     hidden_node: 16
+    aggregation: mean
 
 optimizer:
   fn: torch.optim.Adam
