@@ -1,4 +1,4 @@
-# Spread the virus
+# Infection
 
 ## Task
 1. One node of the graph is _infected_ and identified through a 1 in one element of its feature vector. 
@@ -10,25 +10,38 @@
    
 The network should output a prediction of 1 for nodes that are infected and 0 for the others, effectively
 identifying the neighbors of the infected node, the connection type and the immunity status. 
+The network also outputs a graph-level prediction that should correspond to the total number of infected nodes.
 
-## Generalization strategy
+## Data
 
-## Weighting function
+### Training
+100,000 graphs are generated using the [Barabási–Albert model](https://en.wikipedia.org/wiki/Barab%C3%A1si%E2%80%93Albert_model), 
+every graph contains between 10 and 30 nodes. Up to 10% of the nodes are sick and up to 30% are immune. Edges are virtual with a percentage of up to 30%.  
 
-## Full network
-The full version of the graph network operates as such:
-```
-e_{s \to r}^{t+1} = ReLU [ f_e(e_{s \to r}^t) + f_s(n_s^t) + f_r(n_r^t) + f_u(u^t)]
+### Testing
+20,000 graphs for testing are generated in a similar way, but containing between 10 and 60 nodes. 
+Up to 40% of the nodes are sick and up to 60% are immune. Edges are virtual with a percentage of up to 50%.
 
-n_i^{t+1} = Sigmoid [ g_n(n_i^t) + g_{in}(agg_s(e_{s \to i}^{t+1})) + g_{out}(agg_r(e_{i \to r}^{t+1})) + g_u(u^t)]
+## Losses
 
-u_i^{t+1} = h_n(agg_i(n_i^{t+1})) + h_e(agg_{ij}(e_{i \to j}^{t+1})) + h_u(u^t)
-```
+Three losses are used for training: a node-level loss, a global-level loss and a regularization term.
+The three terms are added together in a weighted sum and constitute the final training objective.
 
-using max as an aggregation function
+### Node-level classification
+At node-level, the network has to output a single binary prediction of whether the node will be sick or not. 
+The loss on this prediction is computed as Binary Cross Entropy.
 
-## Minimal network
-For this task, the minimal version of the network should only use:
+### Global-level regression
+The network should also output a global-level prediction corresponding to the total number of infected nodes.
+The loss on this prediction is computed as Mean Squared Error
+
+Since the total number of infected nodes in the training set is not homogeneously distributed, we weight the losses
+computed on individual graphs using the negative log frequency of the true value. For example, if 15 is the 
+ground-truth number of infected nodes after the spread for a given input graph, we weight the MSE of the network's
+prediction as `-ln(# of graphs with 15 infected nodes in the training set / # number of graphs in the training set)`
+
+### L1 regularization
+The weights of the network are regularized with L1 regularization. 
 
 ## Workflow
 
@@ -39,28 +52,19 @@ For this task, the minimal version of the network should only use:
     ```
 2. Create dataset (plus a small one for debug)
     ```bash
-    python -m infection.dataset generate <dataset.yml> "folder=${INFECTION}/data"
-    python -m infection.dataset generate <dataset.yml> "folder=${INFECTION}/smalldata" datasets.{train,val}.num_samples=5000
+    python -m infection.dataset generate ../config/infection/datasets.yaml "folder=${INFECTION}/data"
+    python -m infection.dataset generate ../config/infection/datasets.yaml \
+           "folder=${INFECTION}/smalldata" \
+           datasets.{train,val}.num_samples=5000
     ```
-3. Create tensorboard layout
-    ```bash
-    python -m infection.layout --folder "$INFECTION/runs"
-    ```
-    
-4. Start a mongo db in a docker container and note its ip address
-    ```bash
-    docker pull mongo:latest
-    docker run -d --name=mongo mongo
-    docker inspect mongo | grep -w IPAddress
-    docker network inspect bridge
-    ```
-   
-5. Launch experiments (use bash)
+4. Launch one experiment:
     ```bash
     python -m infection.train \
        --experiment ../config/infection/train.yaml \
        --model ../config/infection/minimal.yaml
-       
+    ```
+    Or make a grid search over the hyperparameters:
+    ```bash
     conda activate tg-experiments
     function train {
        python -m infection.train \
@@ -70,13 +74,15 @@ For this task, the minimal version of the network should only use:
                --optimizer "kwargs.lr=${2}" \
                --session "losses.l1=${3}" "losses.nodes=${4}" "losses.count=${5}"  
     }    
-    export -f train
-    parallel --eta --max-procs 6 --load 80% --noswap 'export CUDA_VISIBLE_DEVICES=5 && train {1} {2} {3} {4} {5}' \
-    `# Architecture`   ::: adhoc \
+    export -f train # use bash otherwise `export -f` won't work
+    parallel --eta --max-procs 6 --load 80% --noswap 'train {1} {2} {3} {4} {5}' \
+    `# Architecture`   ::: infectionGN \
     `# Learning rate`  ::: .01 .001 \
     `# L1 loss`        ::: 0   .0001 \
     `# Infection loss` ::: 1 .1 \
     `# Count loss`     ::: 1 .1
     ```
-6. Query logs and visualize
-   - Tensorboard: `tensorboard --logdir "$INFECTION/runs"`
+6. Visualize logs: 
+   ```bash
+   tensorboard --logdir "$INFECTION/runs"
+   ```

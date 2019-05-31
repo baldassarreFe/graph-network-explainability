@@ -91,12 +91,6 @@ def set_seeds(seed):
     torch.random.manual_seed(seed)
 
 
-def tail(iterable: Iterable, n=1):
-    """Return an iterator over the last n items"""
-    # tail(3, 'ABCDEFG') --> E F G
-    return iter(collections.deque(iterable, maxlen=n))
-
-
 def sort_dict(mapping: MutableMapping, order: Iterable):
     for key in itertools.chain(filter(mapping.__contains__, order), set(mapping) - set(order)):
         mapping[key] = mapping.pop(key)

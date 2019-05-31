@@ -1,0 +1,47 @@
+name: infection
+tags: []
+epoch: 20
+samples: 2000000
+model:
+  fn: infection.networks.InfectionGN
+  args: []
+  kwargs:
+    aggregation: max
+    bias: false
+  state_dict: /experiments/infection/runs/_VFJYGG/checkpoints/model.e0020.pt
+optimizer:
+  fn: torch.optim.Adam
+  args: []
+  kwargs:
+    lr: 0.001
+  state_dict: /experiments/infection/runs/_VFJYGG/checkpoints/optimizer.e0020.pt
+sessions:
+- epochs: 20
+  batch_size: 1000
+  losses:
+    nodes: 1
+    count: 0
+    l1: 0.001
+  seed: 44
+  cpus: 11
+  device: cuda
+  status: DONE
+  datetime_started: 2019-04-18 16:16:34.420894
+  datetime_completed: 2019-04-18 16:18:45.621812
+  data:
+    folder: /experiments/infection/data
+  log:
+    when:
+    - every batch
+    folder: /experiments/infection/runs/_VFJYGG
+  checkpoint:
+    when:
+    - last epoch
+    folder: /experiments/infection/runs/_VFJYGG
+  cuda:
+    driver: '418.43'
+    gpus:
+    - model: GeForce GTX 1050 Ti with Max-Q Design
+      utilization: 0 %
+      memory_used: 10 MiB
+      memory_total: 4042 MiB

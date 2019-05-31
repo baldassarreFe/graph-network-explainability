@@ -1,0 +1,69 @@
+name: infection
+tags:
+- lr.001
+- nodes.1
+- count1
+- wd0
+epoch: 20
+samples: 2000000
+model:
+  fn: infection.networks.InfectionGN
+  args: []
+  kwargs: {}
+  state_dict: /experiments/infection/runs/lr.001_nodes.1_count1_wd0_QYNATD/checkpoints/model.e0020.pt
+optimizer:
+  fn: torch.optim.Adam
+  args: []
+  kwargs:
+    lr: 0.001
+  state_dict: /experiments/infection/runs/lr.001_nodes.1_count1_wd0_QYNATD/checkpoints/optimizer.e0020.pt
+sessions:
+- epochs: 20
+  batch_size: 1000
+  losses:
+    nodes: 0.1
+    count: 1
+    l1: 0
+  seed: 76
+  cpus: 31
+  device: cuda
+  status: DONE
+  datetime_started: 2019-04-14 19:24:34.801354
+  datetime_completed: 2019-04-14 19:28:47.920841
+  data:
+    folder: /experiments/infection/data
+  log:
+    when:
+    - every batch
+    folder: /experiments/infection/runs/lr.001_nodes.1_count1_wd0_QYNATD
+  checkpoint:
+    when:
+    - last epoch
+    folder: /experiments/infection/runs/lr.001_nodes.1_count1_wd0_QYNATD
+  cuda:
+    driver: '396.37'
+    gpus:
+    - model: GeForce GTX 1080 Ti
+      utilization: 1 %
+      memory_used: 3086 MiB
+      memory_total: 11178 MiB
+    - model: GeForce GTX 1080 Ti
+      utilization: 0 %
+      memory_used: 0 MiB
+      memory_total: 11178 MiB
+    - model: GeForce GTX 1080 Ti
+      utilization: 0 %
+      memory_used: 0 MiB
+      memory_total: 11178 MiB
+    - model: GeForce GTX 1080 Ti
+      utilization: 0 %
+      memory_used: 0 MiB
+      memory_total: 11178 MiB
+    - model: GeForce GTX 1080 Ti
+      utilization: 0 %
+      memory_used: 0 MiB
+      memory_total: 11178 MiB
+    - model: GeForce GTX 1080 Ti
+      utilization: 0 %
+      memory_used: 10 MiB
+      memory_total: 11178 MiB

@@ -1,32 +1,29 @@
 import math
 from collections import OrderedDict
 
-import torch_scatter
-
 import torch
 from torch import nn
-import torch.nn.functional as F
 
 import torchgraphs as tg
 
 
-class AdHoc(nn.Module):
-    def __init__(self):
+class InfectionGN(nn.Module):
+    def __init__(self, aggregation, bias):
         super().__init__()
         self.encoder = nn.Sequential(OrderedDict({
-            'edge': tg.EdgeLinear(4, edge_features=2, bias=False),
+            'edge': tg.EdgeLinear(4, edge_features=2, bias=bias),
             'edge_relu': tg.EdgeReLU(),
-            'node': tg.NodeLinear(8, node_features=4, bias=False),
+            'node': tg.NodeLinear(8, node_features=4, bias=bias),
             'node_relu': tg.NodeReLU(),
         }))
         self.hidden = nn.Sequential(OrderedDict({
-            'edge': tg.EdgeLinear(8, edge_features=4, sender_features=8, bias=False),
+            'edge': tg.EdgeLinear(8, edge_features=4, sender_features=8, bias=bias),
             'edge_relu': tg.EdgeReLU(),
-            'node': tg.NodeLinear(8, node_features=8, incoming_features=8, aggregation='max', bias=False),
+            'node': tg.NodeLinear(8, node_features=8, incoming_features=8, aggregation=aggregation, bias=bias),
             'node_relu': tg.NodeReLU()
         }))
         self.readout_nodes = tg.NodeLinear(1, node_features=8, bias=True)
-        self.readout_globals = tg.GlobalLinear(1, node_features=8, aggregation='sum', bias=False)
+        self.readout_globals = tg.GlobalLinear(1, node_features=8, aggregation='sum', bias=bias)
 
     def forward(self, graphs):
         graphs = self.encoder(graphs)
@@ -39,161 +36,6 @@ class AdHoc(nn.Module):
             num_edges=0,
             num_edges_by_graph=None,
             edge_features=None,
-            global_features=globals,
-            senders=None,
-            receivers=None
-        )
-
-
-class FullGN(nn.Module):
-    def __init__(
-            self,
-            in_edge_features_shape, in_node_features_shape,
-            out_edge_features_shape, out_node_features_shape,
-            out_global_features_shape
-    ):
-        super().__init__()
-
-        self.f_edge = nn.Parameter(torch.Tensor(out_edge_features_shape, in_edge_features_shape))
-        self.f_sender = nn.Parameter(torch.Tensor(out_edge_features_shape, in_node_features_shape))
-        self.f_receiver = nn.Parameter(torch.Tensor(out_edge_features_shape, in_node_features_shape))
-        self.f_bias = nn.Parameter(torch.Tensor(out_edge_features_shape))
-
-        self.g_node = nn.Parameter(torch.Tensor(out_node_features_shape, in_node_features_shape))
-        self.g_in = nn.Parameter(torch.Tensor(out_node_features_shape, out_edge_features_shape))
-        self.g_out = nn.Parameter(torch.Tensor(out_node_features_shape, out_edge_features_shape))
-        self.g_bias = nn.Parameter(torch.Tensor(out_node_features_shape))
-
-        self.h_nodes = nn.Parameter(torch.Tensor(out_node_features_shape, out_global_features_shape))
-        self.h_edges = nn.Parameter(torch.Tensor(out_edge_features_shape, out_global_features_shape))
-        self.h_bias = nn.Parameter(torch.Tensor(out_global_features_shape))
-
-        _reset_parameters(self)
-
-    def forward(self, graphs: tg.GraphBatch):
-        edges = F.relu(
-            graphs.edge_features @ self.f_edge.t() +
-            (graphs.node_features @ self.f_sender.t()).index_select(dim=0, index=graphs.senders) +
-            (graphs.node_features @ self.f_receiver.t()).index_select(dim=0, index=graphs.receivers) +
-            self.f_bias
-        )
-        incoming_edges_agg = torch_scatter.scatter_max(edges, graphs.receivers, dim=0, dim_size=graphs.num_nodes)[0]
-        outgoing_edges_agg = torch_scatter.scatter_max(edges, graphs.senders, dim=0, dim_size=graphs.num_nodes)[0]
-        nodes = (
-                graphs.node_features @ self.g_node.t() +
-                incoming_edges_agg @ self.g_in.t() +
-                outgoing_edges_agg @ self.g_out.t() +
-                self.g_bias
-        )
-        edges_agg = torch_scatter.scatter_add(F.relu(edges), tg.utils.segment_lengths_to_ids(graphs.num_edges_by_graph),
-                                              dim=0, dim_size=graphs.num_graphs)
-        nodes_agg = torch_scatter.scatter_add(F.relu(nodes), tg.utils.segment_lengths_to_ids(graphs.num_nodes_by_graph),
-                                              dim=0, dim_size=graphs.num_graphs)
-        globals = (
-                edges_agg @ self.h_edges.t() +
-                nodes_agg @ self.h_nodes.t() +
-                self.h_bias
-        )
-        return graphs.evolve(
-            node_features=nodes,
-            num_edges=0,
-            num_edges_by_graph=None,
-            edge_features=None,
-            global_features=globals,
-            senders=None,
-            receivers=None
-        )
-
-
-class MinimalGN(nn.Module):
-    def __init__(
-            self,
-            in_edge_features_shape, in_node_features_shape,
-            out_edge_features_shape, out_node_features_shape,
-            out_global_features_shape
-    ):
-        super().__init__()
-
-        self.f_sender = nn.Parameter(torch.Tensor(out_edge_features_shape, in_node_features_shape))
-        self.f_bias = nn.Parameter(torch.Tensor(out_edge_features_shape))
-
-        self.g_node = nn.Parameter(torch.Tensor(out_node_features_shape, in_node_features_shape))
-        self.g_in = nn.Parameter(torch.Tensor(out_node_features_shape, out_edge_features_shape))
-        self.g_bias = nn.Parameter(torch.Tensor(out_node_features_shape))
-
-        self.h_nodes = nn.Parameter(torch.Tensor(out_node_features_shape, out_global_features_shape))
-        self.h_bias = nn.Parameter(torch.Tensor(out_global_features_shape))
-
-        _reset_parameters(self)
-
-    def forward(self, graphs: tg.GraphBatch):
-        edges = F.relu(
-            (graphs.node_features @ self.f_sender.t()).index_select(dim=0, index=graphs.senders) +
-            self.f_bias
-        )
-        incoming_edges_agg = (torch_scatter.scatter_max(edges, graphs.receivers, dim=0, dim_size=graphs.num_nodes)[0])
-        nodes = (
-                graphs.node_features @ self.g_node.t() +
-                incoming_edges_agg @ self.g_in.t() +
-                self.g_bias
-        )
-        nodes_agg = torch_scatter.scatter_add(F.relu(nodes), tg.utils.segment_lengths_to_ids(graphs.num_nodes_by_graph),
-                                              dim=0, dim_size=graphs.num_graphs)
-        globals = (
-                nodes_agg @ self.h_nodes.t() +
-                self.h_bias
-        )
-        return graphs.evolve(
-            node_features=nodes,
-            num_edges=0,
-            edge_features=None,
-            num_edges_by_graph=None,
-            global_features=globals,
-            senders=None,
-            receivers=None
-        )
-
-
-class SubMinimalGN(nn.Module):
-    def __init__(
-            self,
-            in_edge_features_shape, in_node_features_shape,
-            out_edge_features_shape, out_node_features_shape,
-            out_global_features_shape):
-        super().__init__()
-
-        self.f_sender = nn.Parameter(torch.Tensor(out_edge_features_shape, in_node_features_shape))
-        self.f_bias = nn.Parameter(torch.Tensor(out_edge_features_shape))
-
-        self.g_in = nn.Parameter(torch.Tensor(out_node_features_shape, out_edge_features_shape))
-        self.g_bias = nn.Parameter(torch.Tensor(out_node_features_shape))
-
-        self.h_nodes = nn.Parameter(torch.Tensor(out_node_features_shape, out_global_features_shape))
-        self.h_bias = nn.Parameter(torch.Tensor(out_global_features_shape))
-
-        _reset_parameters(self)
-
-    def forward(self, graphs: tg.GraphBatch):
-        edges = F.relu(
-            (graphs.node_features @ self.f_sender.t()).index_select(dim=0, index=graphs.senders) +
-            self.f_bias
-        )
-        incoming_edges_agg = (torch_scatter.scatter_max(edges, graphs.receivers, dim=0, dim_size=graphs.num_nodes)[0])
-        nodes = (
-                incoming_edges_agg @ self.g_in.t() +
-                self.g_bias
-        )
-        nodes_agg = torch_scatter.scatter_add(F.relu(nodes), tg.utils.segment_lengths_to_ids(graphs.num_nodes_by_graph),
-                                              dim=0, dim_size=graphs.num_graphs)
-        globals = (
-                nodes_agg @ self.h_nodes.t() +
-                self.h_bias
-        )
-        return graphs.evolve(
-            node_features=nodes,
-            num_edges=0,
-            edge_features=None,
-            num_edges_by_graph=None,
             global_features=globals,
             senders=None,
             receivers=None

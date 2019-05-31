@@ -1,5 +1,11 @@
 name: infection
 
+model:
+  fn: infection.networks.InfectionGN
+  kwargs:
+    aggregation: max
+    bias: yes
+
 optimizer:
   fn: torch.optim.Adam
   kwargs:

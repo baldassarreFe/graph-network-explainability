@@ -1,0 +1,81 @@
+name: solubility
+tags:
+- layers3
+- lr.01
+- biasyes
+- size64
+- wd.001
+- dryes
+- e50
+- sum
+epoch: 50
+samples: 39450
+model:
+  fn: solubility.networks.SolubilityGN
+  args: []
+  kwargs:
+    num_layers: 3
+    hidden_bias: true
+    hidden_node: 64
+    aggregation: sum
+    dropout: 50
+  state_dict: /experiments/solubility/runs/layers3_lr.01_biasyes_size64_wd.001_dryes_e50_sum_KCJGWG/checkpoints/model.e0050.pt
+optimizer:
+  fn: torch.optim.Adam
+  args: []
+  kwargs:
+    lr: 0.01
+  state_dict: /experiments/solubility/runs/layers3_lr.01_biasyes_size64_wd.001_dryes_e50_sum_KCJGWG/checkpoints/optimizer.e0050.pt
+sessions:
+- epochs: 50
+  batch_size: 50
+  losses:
+    solubility: 1
+    l1: 0.001
+  seed: 94
+  cpus: 31
+  device: cuda
+  status: DONE
+  datetime_started: 2019-04-15 21:30:22.449869
+  datetime_completed: 2019-04-15 21:42:14.467594
+  data:
+    path: /experiments/solubility/data/delaney-processed.csv
+    train: 0.7
+    val: 0.3
+  log:
+    when:
+    - every batch
+    folder: /experiments/solubility/runs/layers3_lr.01_biasyes_size64_wd.001_dryes_e50_sum_KCJGWG
+  checkpoint:
+    when:
+    - last epoch
+    folder: /experiments/solubility/runs/layers3_lr.01_biasyes_size64_wd.001_dryes_e50_sum_KCJGWG
+  cuda:
+    driver: '396.37'
+    gpus:
+    - model: GeForce GTX 1080 Ti
+      utilization: 5 %
+      memory_used: 2432 MiB
+      memory_total: 11178 MiB
+    - model: GeForce GTX 1080 Ti
+      utilization: 0 %
+      memory_used: 0 MiB
+      memory_total: 11178 MiB
+    - model: GeForce GTX 1080 Ti
+      utilization: 0 %
+      memory_used: 0 MiB
+      memory_total: 11178 MiB
+    - model: GeForce GTX 1080 Ti
+      utilization: 0 %
+      memory_used: 0 MiB
+      memory_total: 11178 MiB
+    - model: GeForce GTX 1080 Ti
+      utilization: 0 %
+      memory_used: 0 MiB
+      memory_total: 11178 MiB
+    - model: GeForce GTX 1080 Ti
+      utilization: 0 %
+      memory_used: 0 MiB
+      memory_total: 11178 MiB
+loss_sol_train: 0.5124920198672624
+loss_sol_val: 0.5948061519316165
