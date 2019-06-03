@@ -1,9 +1,10 @@
 # Explainability Techniques for Graph Convolutional Networks
 
-Code and notebooks for the paper "Explainability Techniques for Graph Convolutional Networks" 
+Code and notebooks for the paper ["Explainability Techniques for Graph Convolutional Networks"](https://arxiv.org/abs/1905.13686) 
 accepted at the ICML 2019 Workshop ["Learning and Reasoning with Graph-Structured Data"](https://graphreason.github.io/).
 
-A network trained to predict the solubility of organic molecules is applied to _sucrose_, 
+## Overview
+A Graph Network trained to predict the solubility of organic molecules is applied to _sucrose_, 
 the prediction is explained using [Layer-wise Relevance Propagation](http://heatmapping.org) that assigns 
 positive and negative relevance to the nodes and edges of the molecular graph: 
 
