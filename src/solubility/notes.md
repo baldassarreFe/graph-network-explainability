@@ -28,18 +28,16 @@ The weights of the network are regularized with L1 regularization.
     SOLUBILITY=~/experiments/solubility/
     mkdir -p "$SOLUBILITY/"{runs,data}
     ```
-2. Launch one experiment:
+2. Launch one experiment (from the root of the repo):
     ```bash
-    python -m solubility.train \
-       --experiment ../config/solubility/train.yaml \
-       --model ../config/solubility/minimal.yaml
+    python -m solubility.train --experiment config/solubility/train.yaml
     ```
-    Or make a grid search over the hyperparameters:
+    Or make a grid search over the hyperparameters (from the root of the repo):
     ```bash
     conda activate tg-experiments
     function train {
        python -m solubility.train \
-               --experiment ../config/solubility/train.yaml \
+               --experiment config/solubility/train.yaml \
                             "tags=[layers${3},lr${1},bias${4},size${5},wd${2},dr${7},e${6},${8}]" \
                --model "kwargs.num_layers=${3}" "kwargs.hidden_bias=${4}" "kwargs.hidden_node=${5}" "kwargs.dropout=${6}" "kwargs.aggregation=${8}"\
                --optimizer "kwargs.lr=${1}" \
